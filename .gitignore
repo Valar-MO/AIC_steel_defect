@@ -1,0 +1,40 @@
+# Competition data must never enter Git.
+data/
+datasets/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.xml
+*.zip
+*.tar
+*.tar.gz
+
+# Model artifacts and experiment outputs
+outputs/
+splits/
+runs/
+weights/
+checkpoints/
+wandb/
+mlruns/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+
+# Local configuration and caches
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.idea/
+.vscode/
