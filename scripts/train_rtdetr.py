@@ -29,9 +29,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="0", help="CUDA device, e.g. 0; use cpu only for debugging.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument(
+        "--optimizer", default="auto",
+        help="Ultralytics optimizer name, e.g. AdamW, SGD, MuSGD, or auto.",
+    )
+    parser.add_argument("--lr0", type=float, default=0.01, help="Initial learning rate.")
+    parser.add_argument("--lrf", type=float, default=0.01, help="Final learning-rate multiplier.")
+    parser.add_argument(
+        "--warmup-epochs", type=float, default=3.0,
+        help="Number of learning-rate warmup epochs.",
+    )
+    parser.add_argument(
+        "--mosaic", type=float, default=1.0,
+        help="Mosaic augmentation probability in [0, 1]; use 0 for mixed patch training.",
+    )
     parser.add_argument("--cache", action="store_true", help="Cache images; disabled by default.")
     parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision.")
     parser.add_argument("--exist-ok", action="store_true", help="Allow an existing run directory.")
+    parser.add_argument(
+        "--expected-train-images", type=int,
+        help="Optional safety check for the resolved number of training images.",
+    )
+    parser.add_argument(
+        "--expected-val-images", type=int,
+        help="Optional safety check for the resolved number of validation images.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate and print settings without training.")
     return parser.parse_args()
 
@@ -79,6 +101,17 @@ def preflight(args: argparse.Namespace) -> dict:
         raise FileNotFoundError(f"Dataset YAML not found: {data}")
     if args.imgsz <= 0 or args.epochs <= 0 or args.batch <= 0 or args.workers < 0:
         raise ValueError("imgsz, epochs and batch must be positive; workers cannot be negative")
+    if not 0.0 <= args.mosaic <= 1.0:
+        raise ValueError("mosaic must be in [0, 1]")
+    if args.mosaic not in {0.0, 1.0}:
+        raise ValueError(
+            "This RT-DETR pipeline requires mosaic to be 0 or 1. Fractional mosaic can mix "
+            "1024 and 2048 tensors in one batch and fail during collation."
+        )
+    if args.lr0 <= 0 or not 0 < args.lrf <= 1 or args.warmup_epochs < 0:
+        raise ValueError("Require lr0 > 0, lrf in (0, 1], and warmup_epochs >= 0")
+    if not str(args.optimizer).strip():
+        raise ValueError("optimizer cannot be empty")
 
     with data.open(encoding="utf-8") as f:
         dataset_config = yaml.safe_load(f)
@@ -90,10 +123,17 @@ def preflight(args: argparse.Namespace) -> dict:
     train_path = resolve_split(data, dataset_config, "train")
     val_path = resolve_split(data, dataset_config, "val")
     train_images, val_images = count_images(train_path), count_images(val_path)
-    if (train_images, val_images) != (2560, 640):
+    expected = (args.expected_train_images, args.expected_val_images)
+    actual = (train_images, val_images)
+    mismatches = [
+        f"{name}: expected {wanted}, found {found}"
+        for name, wanted, found in zip(("train", "val"), expected, actual)
+        if wanted is not None and wanted != found
+    ]
+    if mismatches:
         raise ValueError(
-            f"Expected fixed split 2560/640, found {train_images}/{val_images}. "
-            "Refusing to train on an unexpected split."
+            "Dataset size safety check failed (" + "; ".join(mismatches) + "). "
+            "Correct the dataset or update the explicit --expected-*-images values."
         )
 
     run_dir = project / args.name
@@ -111,6 +151,8 @@ def preflight(args: argparse.Namespace) -> dict:
         "classes": names,
         "train_images": train_images,
         "val_images": val_images,
+        "expected_train_images": args.expected_train_images,
+        "expected_val_images": args.expected_val_images,
         "imgsz": args.imgsz,
         "epochs": args.epochs,
         "batch": args.batch,
@@ -118,6 +160,11 @@ def preflight(args: argparse.Namespace) -> dict:
         "device": args.device,
         "seed": args.seed,
         "patience": args.patience,
+        "optimizer": args.optimizer,
+        "lr0": args.lr0,
+        "lrf": args.lrf,
+        "warmup_epochs": args.warmup_epochs,
+        "mosaic": args.mosaic,
         "cache": args.cache,
         "amp": not args.no_amp,
     }
@@ -177,10 +224,15 @@ def main() -> None:
         workers=args.workers,
         device=args.device,
         patience=args.patience,
+        optimizer=args.optimizer,
+        lr0=args.lr0,
+        lrf=args.lrf,
+        warmup_epochs=args.warmup_epochs,
         project=config["project"],
         name=args.name,
         seed=args.seed,
         deterministic=True,
+        mosaic=args.mosaic,
         amp=not args.no_amp,
         cache=args.cache,
         plots=True,
