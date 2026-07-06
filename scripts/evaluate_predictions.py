@@ -217,8 +217,9 @@ def point_metrics(outcomes, gt_count, score_threshold):
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / gt_count if gt_count else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    f2 = 5 * precision * recall / (4 * precision + recall) if precision + recall else 0.0
     return {"tp": tp, "fp": fp, "fn": fn, "precision": precision,
-            "recall": recall, "f1": f1, "prediction_count": len(kept)}
+            "recall": recall, "f1": f1, "f2": f2, "prediction_count": len(kept)}
 
 
 def best_f1(outcomes, gt_count):
@@ -230,6 +231,18 @@ def best_f1(outcomes, gt_count):
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
         if f1 > best["f1"]:
             best = {"threshold": score, "precision": precision, "recall": recall, "f1": f1}
+    return best
+
+
+def best_f2(outcomes, gt_count):
+    best = {"threshold": 1.0, "precision": 0.0, "recall": 0.0, "f2": 0.0}
+    tp = 0
+    for index, (score, is_tp) in enumerate(outcomes, start=1):
+        tp += is_tp
+        precision, recall = tp / index, tp / gt_count if gt_count else 0.0
+        f2 = 5 * precision * recall / (4 * precision + recall) if precision + recall else 0.0
+        if f2 > best["f2"]:
+            best = {"threshold": score, "precision": precision, "recall": recall, "f2": f2}
     return best
 
 
@@ -272,6 +285,8 @@ def main():
             "ap_by_iou": {k: rounded(v) for k, v in aps.items()},
             "best_f1_at_iou": {k: rounded(v) for k, v in
                                 best_f1(outcomes_at_point[class_id], gt_count).items()},
+            "best_f2_at_iou": {k: rounded(v) for k, v in
+                                best_f2(outcomes_at_point[class_id], gt_count).items()},
         }
 
     totals = {key: sum(per_class[name][key] for name in classes)
@@ -279,7 +294,9 @@ def main():
     p = totals["tp"] / (totals["tp"] + totals["fp"]) if totals["tp"] + totals["fp"] else 0.0
     r = totals["tp"] / totals["ground_truth_count"] if totals["ground_truth_count"] else 0.0
     f1 = 2 * p * r / (p + r) if p + r else 0.0
-    overall = {**totals, "precision": rounded(p), "recall": rounded(r), "f1": rounded(f1),
+    f2 = 5 * p * r / (4 * p + r) if p + r else 0.0
+    overall = {**totals, "precision": rounded(p), "recall": rounded(r),
+               "f1": rounded(f1), "f2": rounded(f2),
                "map50": rounded(sum(per_class[n]["ap50"] for n in classes) / len(classes)),
                "map50_95": rounded(sum(per_class[n]["ap50_95"] for n in classes) / len(classes))}
 
@@ -293,7 +310,8 @@ def main():
         recall = tp / (tp + fn) if tp + fn else 0.0
         row = {"threshold": threshold, "tp": tp, "fp": fp, "fn": fn,
                "precision": precision, "recall": recall,
-               "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0}
+               "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+               "f2": 5 * precision * recall / (4 * precision + recall) if precision + recall else 0.0}
         row.update({f"recall_{name}": class_points[i]["recall"] for i, name in enumerate(classes)})
         sweep_rows.append(row)
     with (args.output_dir / "threshold_sweep.csv").open("w", encoding="utf-8-sig", newline="") as f:
@@ -316,6 +334,8 @@ def main():
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"overall": overall,
                       "best_f1_thresholds": {n: per_class[n]["best_f1_at_iou"]["threshold"]
+                                             for n in classes},
+                      "best_f2_thresholds": {n: per_class[n]["best_f2_at_iou"]["threshold"]
                                              for n in classes},
                       "outputs": str(args.output_dir.resolve())}, ensure_ascii=False, indent=2))
 

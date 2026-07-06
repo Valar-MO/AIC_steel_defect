@@ -1,6 +1,6 @@
 # Competition data must never enter Git.
-data/
-datasets/
+/data/
+/datasets/
 *.jpg
 *.jpeg
 *.png
