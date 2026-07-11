@@ -22,6 +22,11 @@ def parse_args():
     p.add_argument("--report", type=Path, default=DEFAULT_DIR / "submission_report.json")
     p.add_argument("--classes", type=Path, default=Path("configs/classes.yaml"))
     p.add_argument("--min-score", type=float, default=0.001)
+    p.add_argument(
+        "--per-class-thresholds",
+        type=Path,
+        help="Optional JSON mapping class name to min score. Overrides --min-score for listed classes.",
+    )
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
@@ -37,6 +42,19 @@ def main():
         classes = [str(x) for x in yaml.safe_load(f)["names"]]
     if raw.get("metadata", {}).get("classes") != classes:
         raise ValueError("Raw prediction classes differ from configs/classes.yaml")
+    per_class_thresholds = {}
+    if args.per_class_thresholds:
+        payload = json.loads(args.per_class_thresholds.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("--per-class-thresholds must point to a JSON object")
+        unknown = sorted(set(payload) - set(classes))
+        if unknown:
+            raise ValueError(f"Unknown classes in threshold JSON: {unknown}")
+        for name, value in payload.items():
+            threshold = float(value)
+            if not 0 <= threshold <= 1:
+                raise ValueError(f"Invalid threshold for {name}: {threshold}")
+            per_class_thresholds[name] = threshold
 
     submission = []
     class_counts = Counter({name: 0 for name in classes})
@@ -48,10 +66,11 @@ def main():
         kept_for_image = 0
         for prediction in image.get("predictions", []):
             score = float(prediction["score"])
-            if score < args.min_score:
+            name = prediction["category_name"]
+            threshold = per_class_thresholds.get(name, args.min_score)
+            if score < threshold:
                 threshold_dropped += 1
                 continue
-            name = prediction["category_name"]
             class_id = int(prediction["class_id"])
             if not 0 <= class_id < len(classes) or classes[class_id] != name:
                 raise ValueError(f"Invalid class mapping in {image['image_id']}: {class_id}, {name}")
@@ -85,6 +104,7 @@ def main():
         "raw_predictions": str(args.raw.resolve()),
         "submission": str(args.output.resolve()),
         "min_score": args.min_score,
+        "per_class_thresholds": per_class_thresholds or None,
         "processed_images": image_count,
         "images_with_predictions": images_with_predictions,
         "images_without_predictions": image_count - images_with_predictions,

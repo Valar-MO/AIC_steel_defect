@@ -10,13 +10,14 @@ import math
 import random
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +61,8 @@ def parse_args() -> argparse.Namespace:
             ("training", "min_delta"): "min_delta",
             ("training", "save_every"): "save_every",
             ("training", "amp_dtype"): "amp_dtype",
+            ("sampler", "type"): "sampler",
+            ("sampler", "max_weight"): "sampler_max_weight",
             ("experiment", "project"): "project",
             ("experiment", "name"): "name",
             ("experiment", "seed"): "seed",
@@ -70,6 +73,16 @@ def parse_args() -> argparse.Namespace:
                 defaults[destination] = section[keys[1]]
         if "amp" in payload.get("training", {}):
             defaults["no_amp"] = not bool(payload["training"]["amp"])
+        sampler_payload = payload.get("sampler", {})
+        if isinstance(sampler_payload, dict):
+            if "sample_type_weights" in sampler_payload:
+                defaults["sampler_sample_type_weights"] = json.dumps(
+                    sampler_payload["sample_type_weights"], ensure_ascii=False
+                )
+            if "class_weights" in sampler_payload:
+                defaults["sampler_class_weights"] = json.dumps(
+                    sampler_payload["class_weights"], ensure_ascii=False
+                )
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
@@ -109,6 +122,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--max-steps", type=int, help="Stop after this many optimizer steps (smoke tests).")
     parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--sampler", choices=("none", "class_aware"), default="none")
+    parser.add_argument("--sampler-max-weight", type=float, default=4.0)
+    parser.add_argument(
+        "--sampler-sample-type-weights",
+        default='{"whole": 1.0, "regular_positive": 1.0, "rare_center": 2.0, '
+                '"random_background": 0.7, "hard_negative": 2.0}',
+        help="JSON mapping from sample_manifest.csv sample_type to sampling weight.",
+    )
+    parser.add_argument(
+        "--sampler-class-weights",
+        default='{"huashang": 3.0, "qilie": 3.0, "zonglie": 2.0, "yanghuatiepi": 2.0}',
+        help="JSON mapping from class name to sampling weight.",
+    )
     parser.add_argument("--exist-ok", action="store_true")
     parser.set_defaults(**defaults)
     return parser.parse_args()
@@ -195,6 +221,118 @@ def make_scheduler(optimizer, total_steps: int, warmup_steps: int, start_factor:
     return LambdaLR(optimizer, multiplier)
 
 
+def parse_weight_mapping(payload: str, name: str) -> dict[str, float]:
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    output = {}
+    for key, value in parsed.items():
+        try:
+            weight = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name}.{key} must be numeric") from exc
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError(f"{name}.{key} must be a positive finite number")
+        output[str(key)] = weight
+    return output
+
+
+def load_sample_manifest(dataset_yaml: Path) -> dict[str, dict]:
+    import yaml
+
+    config = yaml.safe_load(Path(dataset_yaml).read_text(encoding="utf-8")) or {}
+    root = Path(config.get("path", Path(dataset_yaml).parent))
+    if not root.is_absolute():
+        root = (Path(dataset_yaml).parent / root).resolve()
+    manifest = root / "sample_manifest.csv"
+    if not manifest.is_file():
+        raise FileNotFoundError(
+            f"Class-aware sampler requires mixed dataset sample_manifest.csv: {manifest}"
+        )
+    rows_by_sample = {}
+    with manifest.open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            sample_path = Path(row["sample_path"])
+            if not sample_path.is_absolute():
+                sample_path = root / sample_path
+            rows_by_sample[str(sample_path.resolve())] = row
+    if not rows_by_sample:
+        raise ValueError(f"Empty sample manifest: {manifest}")
+    return rows_by_sample
+
+
+def build_class_aware_sampler(dataset: YoloDetectionDataset, args, run_dir: Path):
+    if args.sampler == "none":
+        return None, None
+    if args.sampler != "class_aware":
+        raise ValueError(f"Unsupported sampler: {args.sampler}")
+    if args.sampler_max_weight < 1.0:
+        raise ValueError("--sampler-max-weight must be >= 1")
+
+    sample_type_weights = parse_weight_mapping(
+        args.sampler_sample_type_weights, "--sampler-sample-type-weights"
+    )
+    class_weights = parse_weight_mapping(args.sampler_class_weights, "--sampler-class-weights")
+    manifest = load_sample_manifest(dataset.dataset_yaml)
+
+    weights, missing = [], []
+    sample_type_counts, sample_type_weight_mass = Counter(), Counter()
+    class_counts, class_weight_mass = Counter(), Counter()
+    for image_path in dataset.images:
+        key = str(Path(image_path).resolve())
+        row = manifest.get(key)
+        if row is None:
+            missing.append(key)
+            weights.append(1.0)
+            continue
+        sample_type = row.get("sample_type", "")
+        classes = [item for item in row.get("classes", "").split("|") if item]
+        weight = sample_type_weights.get(sample_type, 1.0)
+        for class_name in classes:
+            weight = max(weight, class_weights.get(class_name, 1.0))
+        weight = min(float(weight), float(args.sampler_max_weight))
+        weights.append(weight)
+        sample_type_counts[sample_type] += 1
+        sample_type_weight_mass[sample_type] += weight
+        for class_name in classes:
+            class_counts[class_name] += 1
+            class_weight_mass[class_name] += weight
+
+    if missing:
+        preview = ", ".join(missing[:3])
+        raise ValueError(
+            f"{len(missing)} training images are missing from sample_manifest.csv; "
+            f"first examples: {preview}"
+        )
+    weight_tensor = torch.as_tensor(weights, dtype=torch.double)
+    sampler = WeightedRandomSampler(
+        weights=weight_tensor,
+        num_samples=len(weight_tensor),
+        replacement=True,
+        generator=torch.Generator().manual_seed(args.seed),
+    )
+    summary = {
+        "type": "class_aware",
+        "num_samples": len(weights),
+        "min_weight": round(min(weights), 6),
+        "mean_weight": round(sum(weights) / len(weights), 6),
+        "max_weight": round(max(weights), 6),
+        "sample_type_weights": sample_type_weights,
+        "class_weights": class_weights,
+        "sample_type_counts": dict(sample_type_counts),
+        "sample_type_weight_mass": {key: round(value, 3) for key, value in sample_type_weight_mass.items()},
+        "class_counts": dict(class_counts),
+        "class_weight_mass": {key: round(value, 3) for key, value in class_weight_mass.items()},
+    }
+    (run_dir / "sampler_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return sampler, summary
+
+
 def main() -> None:
     args = parse_args()
     missing = [name for name in ("data", "dinov2_weights", "rtdetr_weights", "name")
@@ -243,7 +381,8 @@ def main() -> None:
         collate_fn=detection_collate,
         persistent_workers=args.workers > 0,
     )
-    train_loader = DataLoader(train_set, shuffle=True, **loader_kwargs)
+    train_sampler, sampler_summary = build_class_aware_sampler(train_set, args, run_dir)
+    train_loader = DataLoader(train_set, sampler=train_sampler, shuffle=train_sampler is None, **loader_kwargs)
     val_loader = DataLoader(val_set, shuffle=False, **loader_kwargs)
 
     model = build_dinov2_rtdetr(
@@ -300,6 +439,7 @@ def main() -> None:
         "run_dir": str(run_dir), "train_images": len(train_set), "val_images": len(val_set),
         "classes": train_set.names, "amp": amp_enabled,
         "amp_dtype": args.amp_dtype if amp_enabled else None,
+        "sampler": sampler_summary or {"type": "none"},
         "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "frozen_parameters": sum(p.numel() for p in model.parameters() if not p.requires_grad),
     }, ensure_ascii=False, indent=2))

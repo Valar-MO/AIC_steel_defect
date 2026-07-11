@@ -7,7 +7,7 @@ model:
   num_classes: 9
 
 data:
-  yaml: /root/autodl-tmp/datasets/AIC_steel_defect_mixed/steel.yaml
+  yaml: /root/autodl-tmp/datasets/AIC_steel_defect_mixed_v2_loose/steel.yaml
   image_size: 1008
   horizontal_flip: 0.5
   vertical_flip: 0.0
@@ -28,6 +28,21 @@ training:
   save_every: 5
   amp: true
   amp_dtype: bfloat16
+
+sampler:
+  type: class_aware
+  max_weight: 4.0
+  sample_type_weights:
+    whole: 1.0
+    regular_positive: 1.0
+    rare_center: 1.5
+    random_background: 0.7
+    hard_negative: 1.3
+  class_weights:
+    huashang: 2.0
+    qilie: 2.0
+    zonglie: 1.5
+    yanghuatiepi: 1.5
 
 experiment:
   project: /root/autodl-tmp/runs/dinov2_rtdetr
