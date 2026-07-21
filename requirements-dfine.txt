@@ -1,0 +1,5 @@
+# Additional runtime dependencies used by the official Peterande/D-FINE checkout.
+tensorboard>=2.21
+faster-coco-eval>=1.7.2
+calflops>=0.3.2
+loguru>=0.7.3
