@@ -1,0 +1,77 @@
+__include__: [
+  '../../../dataset/aic_defect_detection.yml',
+  '../../../runtime.yml',
+  '../../include/dataloader.yml',
+  '../../include/optimizer.yml',
+  '../../include/dfine_hgnetv2.yml',
+]
+
+output_dir: ./output/dfine_hgnetv2_l_obj2aic_defect
+
+# Shared by the hybrid encoder and decoder positional encodings; it must match
+# the fixed train/validation resize below.
+eval_spatial_size: [1024, 1024]
+
+DFINE:
+  backbone: HGNetv2
+
+HGNetv2:
+  name: 'B4'
+  return_idx: [1, 2, 3]
+  freeze_stem_only: True
+  freeze_at: 0
+  freeze_norm: True
+  pretrained: False
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.0000125
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.00025
+  betas: [0.9, 0.999]
+  weight_decay: 0.000125
+
+epochs: 36
+train_dataloader:
+  # 1024 retains substantially more small-defect detail than D-FINE's 640 default.
+  # Start with 4 on a 48 GB RTX 4090 and raise only after a successful smoke run.
+  total_batch_size: 4
+  dataset:
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [1024, 1024]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        epoch: 30
+  collate_fn:
+    base_size: 1024
+    stop_epoch: 30
+    ema_restart_decay: 0.9999
+    # Disable random resolution initially: mixed crops already supply scale diversity.
+    base_size_repeat: ~
+
+val_dataloader:
+  total_batch_size: 4
+  dataset:
+    transforms:
+      ops:
+        - {type: Resize, size: [1024, 1024]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+
+ema:
+  warmups: 0
+
+lr_warmup_scheduler:
+  warmup_duration: 0
