@@ -41,7 +41,10 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=opt.workers, pin_memory=device.type == "cuda",
                         persistent_workers=opt.workers > 0, collate_fn=gl_cascade_collate)
     checkpoint = torch.load(opt.checkpoint, map_location="cpu", weights_only=False)
-    model = GLCascadeDetector(pretrained_backbone=False).to(device)
+    train_args = checkpoint.get("args", {})
+    model = GLCascadeDetector(backbone_name=train_args.get("backbone", "r50_dcn"), pretrained_backbone=False,
+                              internimage_root=train_args.get("internimage_root"),
+                              backbone_checkpointing=bool(train_args.get("backbone_checkpointing", False))).to(device)
     model.load_state_dict(checkpoint["model"], strict=True); model.eval()
     records = []
     with torch.inference_mode():
@@ -49,7 +52,10 @@ def main() -> None:
             local, global_image = batch["local"].to(device, non_blocking=True), batch["global"].to(device, non_blocking=True)
             target = batch["targets"][0]
             output = model(local, global_image, target["view_xyxy"].unsqueeze(0).to(device), target["image_size"].unsqueeze(0).to(device))
-            records.append((target["image_id"], output.detections[0], target["view_xyxy"].to(device), target["image_size"].to(device)))
+            # A validation pass has thousands of tiles.  Merge records must
+            # leave CUDA immediately rather than retaining every tile graph.
+            detection = {key: value.cpu() for key, value in output.detections[0].items()}
+            records.append((target["image_id"], detection, target["view_xyxy"].cpu(), target["image_size"].cpu()))
             if index % 100 == 0:
                 print(json.dumps({"tiles": index, "total": len(dataset)}, ensure_ascii=False), flush=True)
     merged = group_and_merge(records, opt.local_input_size, opt.border_penalty, opt.soft_nms_iou)

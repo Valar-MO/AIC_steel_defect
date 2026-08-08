@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from .backbone import ResNet50DCNBackbone
+from .backbone import build_backbone
 from .fpn import GlobalLocalFPN
 from .postprocess import classwise_soft_nms
 from .roi import CascadeROIHeads
@@ -23,9 +23,12 @@ class GLCascadeOutput:
 class GLCascadeDetector(nn.Module):
     """Shared global/local detector; global features provide context only at P3/P4."""
 
-    def __init__(self, num_classes: int = 9, pretrained_backbone: bool = True, ranking_quality_weight: float = .25):
+    def __init__(self, num_classes: int = 9, backbone_name: str = "r50_dcn", pretrained_backbone: bool = True,
+                 internimage_root: str | None = None, internimage_checkpoint: str | None = None,
+                 backbone_checkpointing: bool = False, ranking_quality_weight: float = .25):
         super().__init__()
-        self.backbone = ResNet50DCNBackbone(pretrained=pretrained_backbone)
+        self.backbone = build_backbone(backbone_name, pretrained=pretrained_backbone, internimage_root=internimage_root,
+                                       internimage_checkpoint=internimage_checkpoint, with_checkpointing=backbone_checkpointing)
         self.fpn = GlobalLocalFPN(self.backbone.out_channels)
         self.rpn = ATSSRPN()
         self.roi_heads = CascadeROIHeads(num_classes=num_classes)

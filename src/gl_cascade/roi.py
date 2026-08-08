@@ -225,10 +225,18 @@ class CascadeROIHeads(nn.Module):
         losses[f"roi{stage}_class"] = self.eql(output["class_logits"], labels, weights)
         losses[f"roi{stage}_foreground"] = F.binary_cross_entropy_with_logits(output["foreground"], foreground, reduction="none").mul(weights).sum() / weights.sum().clamp(min=1)
         positive = foreground.bool()
+        references = torch.cat(sampled_boxes)
         if positive.any():
-            encoded = encode_boxes(torch.cat(sampled_boxes)[positive], target_boxes[positive])
+            encoded = encode_boxes(references[positive], target_boxes[positive])
             losses[f"roi{stage}_box"] = F.smooth_l1_loss(output["box_delta"][positive], encoded, reduction="none").sum(dim=1).mul(
                 weights[positive]).sum() / weights[positive].sum().clamp(min=1)
+            # Quality must describe the *refined* cascade box, not the IoU of
+            # the proposal before this stage has corrected it.
+            quality_target = ious.clone()
+            with torch.no_grad():
+                quality_target[positive] = box_iou(decode_boxes(references[positive], output["box_delta"][positive]),
+                                                    target_boxes[positive]).diag()
         else:
             losses[f"roi{stage}_box"] = output["box_delta"].sum() * 0
-        losses[f"roi{stage}_quality"] = quality_loss(output["quality"], ious, positive, weights)
+            quality_target = ious
+        losses[f"roi{stage}_quality"] = quality_loss(output["quality"], quality_target, positive, weights)
