@@ -68,7 +68,12 @@ class ATSSAssigner:
             candidate_indices.append(distances.topk(min(self.topk, len(level_anchors)), dim=0, largest=False).indices + offset)
             offset += len(level_anchors)
         candidates = torch.cat(candidate_indices, dim=0)  # [L*topk, num_gt]
-        candidate_ious = box_iou(anchors[candidates.reshape(-1)], gt_boxes).reshape(candidates.shape[0], -1)
+        # ``candidates[row, gt]`` is paired with that same GT.  A full IoU
+        # matrix here would otherwise mix all GT columns whenever an image
+        # contains more than one defect.
+        pair_iou_matrix = box_iou(anchors[candidates.reshape(-1)], gt_boxes)
+        paired_gt = torch.arange(len(gt_boxes), device=anchors.device).repeat(candidates.shape[0])
+        candidate_ious = pair_iou_matrix[torch.arange(candidates.numel(), device=anchors.device), paired_gt].reshape(candidates.shape)
         threshold = candidate_ious.mean(dim=0) + candidate_ious.std(dim=0, unbiased=False)
         candidate_centres = centres[candidates]
         inside = ((candidate_centres[..., 0] >= gt_boxes[None, :, 0]) & (candidate_centres[..., 0] <= gt_boxes[None, :, 2]) &
