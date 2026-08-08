@@ -7,7 +7,7 @@ from torch.nn import functional as F
 
 
 class EQLv2Loss(nn.Module):
-    """Compact EQLv2-style equalization for nine sigmoid class logits.
+    """EQLv2 equalization for nine sigmoid class logits.
 
     The running positive/negative gradient statistics are intentionally shared
     across cascade stages; rare categories therefore receive the same signal
@@ -29,15 +29,18 @@ class EQLv2Loss(nn.Module):
         target = torch.zeros_like(logits)
         positive = labels >= 0
         target[torch.arange(len(labels), device=labels.device), labels.clamp(min=0)] = positive.to(logits.dtype)
-        probability = logits.sigmoid()
+        probability = logits.detach().sigmoid()
         ratio = self.positive_grad / self.negative_grad.clamp(min=1e-6)
         negative_weight = 1 / (1 + torch.exp(-self.gamma * (ratio - self.mu)))
-        class_weight = target + (1 - target) * negative_weight[None]
-        focal = (target * (1 - probability) + (1 - target) * probability).pow(self.alpha)
-        loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none") * focal * class_weight
+        # EQLv2 keeps rare-class positives strong while suppressing their
+        # overwhelming negative gradients.  ``alpha`` is the positive boost,
+        # not a focal exponent.
+        positive_weight = 1 + self.alpha * (1 - negative_weight)
+        class_weight = target * positive_weight[None] + (1 - target) * negative_weight[None]
+        loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none") * class_weight
         if self.training:
             with torch.no_grad():
-                gradient = (probability - target).abs() * class_weight
+                gradient = (probability - target).abs()
                 self.positive_grad.add_((gradient * target).sum(dim=0))
                 self.negative_grad.add_((gradient * (1 - target)).sum(dim=0))
         per_roi = loss.sum(dim=1)

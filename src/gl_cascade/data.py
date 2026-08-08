@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, WeightedRandomSampler
 from torchvision.transforms.functional import InterpolationMode, normalize, pil_to_tensor, resize
 import yaml
 
@@ -96,10 +96,12 @@ class OfficialGridGlobalLocalDataset(Dataset):
             raise ValueError(f"No {split!r} rows in {manifest}")
         self.global_input_size, self.local_input_size = global_input_size, local_input_size
         self.records = []
+        self.tile_labels: list[tuple[int, ...]] = []
         for row in rows:
             width, height, boxes = _read_voc(Path(row["xml_path"]), class_to_id)
             for view in official_windows(width, height, tile_size, overlap):
                 self.records.append(GridRecord(Path(row["image_path"]), width, height, boxes, view))
+                self.tile_labels.append(tuple(_crop_targets(boxes, view, local_input_size)["labels"].tolist()))
 
     def __len__(self) -> int:
         return len(self.records)
@@ -125,3 +127,37 @@ class OfficialGridGlobalLocalDataset(Dataset):
 def gl_cascade_collate(batch: list[dict]) -> dict:
     return {"local": torch.stack([item["local"] for item in batch]), "global": torch.stack([item["global"] for item in batch]),
             "targets": [item["target"] for item in batch]}
+
+
+class OfficialGridBalancedSampler(WeightedRandomSampler):
+    """Keep real empty-tile pressure while giving rare positive tiles a chance.
+
+    Empty windows receive a fixed total probability mass.  The remaining mass
+    is divided between positive tiles using a capped inverse-square-root count
+    for every class present in a tile.  Thus EQLv2 is not asked to repair a
+    proposal distribution that almost never sees qilie or huashang.
+    """
+
+    def __init__(self, dataset: OfficialGridGlobalLocalDataset, empty_fraction: float = .55,
+                 rare_power: float = .5, max_rare_boost: float = 4.0, seed: int = 20260724):
+        if not 0 < empty_fraction < 1:
+            raise ValueError("empty_fraction must be in (0, 1)")
+        labels = dataset.tile_labels
+        empty = [index for index, item in enumerate(labels) if not item]
+        positive = [index for index, item in enumerate(labels) if item]
+        if not empty or not positive:
+            raise ValueError("Official grid sampler requires both empty and positive tiles")
+        counts = torch.zeros(9, dtype=torch.float64)
+        for item in labels:
+            for label in set(item):
+                counts[label] += 1
+        reference = counts[counts > 0].median()
+        boost = (reference / counts.clamp(min=1)).pow(rare_power).clamp(max=max_rare_boost)
+        weights = torch.zeros(len(labels), dtype=torch.double)
+        weights[empty] = empty_fraction / len(empty)
+        positive_raw = torch.tensor([max(float(boost[label]) for label in set(labels[index])) for index in positive], dtype=torch.double)
+        weights[positive] = positive_raw * ((1 - empty_fraction) / positive_raw.sum())
+        generator = torch.Generator(); generator.manual_seed(seed)
+        super().__init__(weights, len(weights), replacement=True, generator=generator)
+        self.class_tile_counts = counts.to(torch.long).tolist()
+        self.empty_fraction = empty_fraction

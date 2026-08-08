@@ -119,11 +119,14 @@ def _flatten_predictions(logits: list[torch.Tensor], deltas: list[torch.Tensor],
 
 
 class ATSSRPN(nn.Module):
-    def __init__(self, channels: int = 256, pre_nms_topk: int = 2000, post_nms_topk: int = 1000):
+    def __init__(self, channels: int = 256, pre_nms_topk: tuple[int, ...] = (1200, 1000, 800, 600, 400),
+                 post_nms_topk: int = 1000):
         super().__init__()
         self.anchor_generator = AnchorGenerator()
         self.assigner = ATSSAssigner()
         self.head = RPNHead(channels, self.anchor_generator.num_anchors)
+        if len(pre_nms_topk) != 5:
+            raise ValueError("pre_nms_topk must provide one quota for P2-P6")
         self.pre_nms_topk, self.post_nms_topk = pre_nms_topk, post_nms_topk
 
     def forward(self, features: OrderedDict[str, torch.Tensor], image_size: tuple[int, int],
@@ -132,19 +135,27 @@ class ATSSRPN(nn.Module):
         anchors_by_level = self.anchor_generator(features)
         logits, deltas = _flatten_predictions(logits_by_level, deltas_by_level, self.anchor_generator.num_anchors)
         anchors = torch.cat(anchors_by_level)
-        proposals = self._proposals(logits.detach(), deltas.detach(), anchors, image_size)
+        proposals = self._proposals(logits_by_level, deltas_by_level, anchors_by_level, image_size)
         output = {"proposals": proposals, "rpn_logits": logits, "rpn_deltas": deltas, "anchors": anchors}
         if targets is not None:
             output["losses"] = self.losses(logits, deltas, anchors_by_level, targets)
         return output
 
-    def _proposals(self, logits: torch.Tensor, deltas: torch.Tensor, anchors: torch.Tensor,
+    def _proposals(self, logits_by_level: list[torch.Tensor], deltas_by_level: list[torch.Tensor], anchors_by_level: list[torch.Tensor],
                    image_size: tuple[int, int]) -> list[torch.Tensor]:
         proposals = []
-        for scores, image_deltas in zip(logits.sigmoid(), deltas):
-            count = min(self.pre_nms_topk, len(scores))
-            top_scores, indices = scores.topk(count)
-            boxes = clip_boxes(decode_boxes(anchors[indices], image_deltas[indices]), *image_size)
+        batch_size = logits_by_level[0].shape[0]
+        for image_index in range(batch_size):
+            all_boxes, all_scores = [], []
+            for level_logits, level_deltas, level_anchors, quota in zip(logits_by_level, deltas_by_level, anchors_by_level, self.pre_nms_topk):
+                scores = level_logits[image_index].permute(1, 2, 0).reshape(-1).detach().sigmoid()
+                anchors_per_location = self.anchor_generator.num_anchors
+                image_deltas = level_deltas[image_index].reshape(anchors_per_location, 4, *level_logits.shape[-2:]).permute(2, 3, 0, 1).reshape(-1, 4).detach()
+                count = min(quota, len(scores))
+                top_scores, indices = scores.topk(count)
+                all_boxes.append(clip_boxes(decode_boxes(level_anchors[indices], image_deltas[indices]), *image_size))
+                all_scores.append(top_scores)
+            boxes, top_scores = torch.cat(all_boxes), torch.cat(all_scores)
             keep = remove_small_boxes(boxes, 2)
             boxes, top_scores = boxes[keep], top_scores[keep]
             keep = nms(boxes, top_scores, .7)[:self.post_nms_topk]

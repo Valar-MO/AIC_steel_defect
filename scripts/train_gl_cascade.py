@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.gl_cascade import GLCascadeDetector, OfficialGridGlobalLocalDataset, gl_cascade_collate
+from src.gl_cascade import GLCascadeDetector, OfficialGridBalancedSampler, OfficialGridGlobalLocalDataset, gl_cascade_collate
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,10 +26,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=.05)
+    parser.add_argument("--empty-fraction", type=float, default=.55)
     parser.add_argument("--global-input-size", type=int, default=1024)
     parser.add_argument("--local-input-size", type=int, default=1536)
     parser.add_argument("--pretrained-backbone", action="store_true")
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--validate-every", type=int, default=1)
+    parser.add_argument("--val-workers", type=int, default=4)
     parser.add_argument("--limit-steps", type=int, help="Smoke-test only: stop early without changing data geometry.")
     return parser.parse_args()
 
@@ -38,6 +42,20 @@ def _to_device(targets: list[dict], device: torch.device) -> list[dict]:
             for target in targets]
 
 
+def _validate(opt: argparse.Namespace, checkpoint: Path, epoch: int) -> dict:
+    epoch_dir = opt.output_dir / "val" / f"epoch_{epoch:02d}"
+    predictions, report = epoch_dir / "merged_predictions.json", epoch_dir / "report.json"
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run([sys.executable, str(root / "scripts" / "predict_gl_cascade.py"), "--checkpoint", str(checkpoint),
+                    "--manifest", str(opt.manifest), "--classes", str(opt.classes), "--split", "val", "--output", str(predictions),
+                    "--workers", str(opt.val_workers), "--global-input-size", str(opt.global_input_size),
+                    "--local-input-size", str(opt.local_input_size)], check=True)
+    subprocess.run([sys.executable, str(root / "scripts" / "evaluate_gl_cascade.py"), "--predictions", str(predictions),
+                    "--manifest", str(opt.manifest), "--classes", str(opt.classes), "--split", "val", "--score-threshold", ".30",
+                    "--output", str(report)], check=True)
+    return json.loads(report.read_text(encoding="utf-8"))
+
+
 def main() -> None:
     args = parse_args()
     if args.batch_size != 1:
@@ -45,7 +63,8 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = OfficialGridGlobalLocalDataset(args.manifest, args.classes, split="train", global_input_size=args.global_input_size,
                                              local_input_size=args.local_input_size)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=device.type == "cuda",
+    sampler = OfficialGridBalancedSampler(dataset, empty_fraction=args.empty_fraction)
+    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.workers, pin_memory=device.type == "cuda",
                         persistent_workers=args.workers > 0, collate_fn=gl_cascade_collate)
     model = GLCascadeDetector(pretrained_backbone=args.pretrained_backbone).to(device)
     optimizer = torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad),
@@ -84,9 +103,12 @@ def main() -> None:
             scaler.unscale_(optimizer); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True)
         checkpoint = {"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "args": vars(args)}
-        torch.save(checkpoint, args.output_dir / f"epoch_{epoch + 1:02d}.pth")
-        print(json.dumps({"epoch": epoch + 1, "mean_losses": {name: value / step for name, value in running.items()},
-                          "checkpoint": str(args.output_dir / f'epoch_{epoch + 1:02d}.pth')}, ensure_ascii=False), flush=True)
+        checkpoint_path = args.output_dir / f"epoch_{epoch + 1:02d}.pth"
+        torch.save(checkpoint, checkpoint_path)
+        summary = {"epoch": epoch + 1, "mean_losses": {name: value / step for name, value in running.items()}, "checkpoint": str(checkpoint_path)}
+        if not args.limit_steps and args.validate_every and (epoch + 1) % args.validate_every == 0:
+            summary["validation"] = _validate(args, checkpoint_path, epoch + 1)
+        print(json.dumps(summary, ensure_ascii=False), flush=True)
         if args.limit_steps:
             return
 
