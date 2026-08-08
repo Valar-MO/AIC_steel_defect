@@ -1,0 +1,45 @@
+# Frozen from the train-only CPU audit written by scripts/audit_gl_cascade_geometry.py.
+# Validation labels are never used to select these values.
+experiment: gl_cascade_full
+
+data:
+  global_input_size: 1024
+  local_crop_size: 2048
+  local_input_size: 1536
+  local_overlap: 512
+  local_stride: 1536
+  local_detector_is_primary: true
+  global_fallback_for_incomplete_local_gt: true
+  crop_visibility:
+    normal_min_fraction: 0.70
+    partial_min_fraction: 0.50
+    severe_partial_ignore_below: 0.50
+
+proposal:
+  assigner: atss
+  fpn_strides: [4, 8, 16, 32, 64]
+  # ratio is width / height; class-balanced log-space k-means, K=5.
+  anchor_ratios: [0.064, 0.188, 0.488, 1.224, 3.564]
+  # Local 1536-pixel GT sqrt-area p05/p25/p50/p90/p95:
+  # 17.4 / 32.1 / 45.8 / 109.4 / 160.4. P2-P6 base sizes cover this range.
+  anchor_base_sizes: [16, 32, 64, 128, 256]
+  atss_topk: 9
+
+architecture:
+  local_fpn_levels: [P2, P3, P4, P5, P6]
+  global_context_levels: [P3, P4]
+  keep_p2_local_only: true
+  cascade_iou_thresholds: [0.50, 0.55, 0.60]
+  roi_pool_size: 7
+  shape_roi_long_side: 28
+
+loss:
+  proposal_objectness: focal
+  proposal_box: giou
+  class_long_tail: eqlv2
+  quality_is_centered_ranking_residual: true
+
+inference:
+  local_windows: fixed_sliding
+  classwise_nms_iou: 0.80
+  merge_method: soft_nms
