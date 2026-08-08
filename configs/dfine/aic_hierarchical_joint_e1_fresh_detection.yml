@@ -1,0 +1,8 @@
+__include__: ['aic_hierarchical_joint_e1_detection.yml']
+
+train_dataloader:
+  dataset:
+    # 768 steps/epoch at batch 16.  Thirty-six epochs provide 27,648 updates,
+    # enough to relearn Selection under the new view distribution from generic
+    # D-FINE weights rather than inherit A0's mixed-view calibration.
+    epoch_size: 12288

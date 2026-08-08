@@ -1,0 +1,39 @@
+task: detection
+evaluator: {type: CocoEvaluator, iou_types: ['bbox']}
+num_classes: 9
+remap_mscoco_category: False
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: OfficialViewBatchMixDataset
+    # Per physical batch: 8 whole, 4 natural official tiles, 2 A0 hard-FP
+    # tiles, one ordinary positive tile, one weak-positive tile.
+    pattern: [whole, whole, whole, whole, whole, whole, whole, whole,
+              natural_tile, natural_tile, natural_tile, natural_tile,
+              hard_background_tile, hard_background_tile, positive_tile, weak_positive_tile]
+    epoch_size: 8192
+    seed: 20260807
+    dataset:
+      type: OfficialViewCocoDetection
+      img_folder: /root/autodl-tmp/datasets/AIC_steel_defect/train/train
+      ann_file: /root/autodl-tmp/datasets/AIC_steel_defect_joint_e1/annotations/instances_train.json
+      return_masks: False
+      transforms: {type: Compose, ops: ~}
+  shuffle: False
+  num_workers: 4
+  drop_last: True
+  collate_fn: {type: BatchImageCollateFunction}
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: OfficialViewCocoDetection
+    img_folder: /root/autodl-tmp/datasets/AIC_steel_defect/train/train
+    ann_file: /root/autodl-tmp/datasets/AIC_steel_defect_joint_e1/annotations/instances_val.json
+    return_masks: False
+    transforms: {type: Compose, ops: ~}
+  shuffle: False
+  num_workers: 4
+  drop_last: False
+  collate_fn: {type: BatchImageCollateFunction}

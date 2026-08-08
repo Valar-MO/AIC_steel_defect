@@ -1,0 +1,138 @@
+__include__: [
+  '../../../dataset/aic_hierarchical_detection.yml',
+  '../../../runtime.yml',
+  '../../include/optimizer.yml',
+  '../../include/dfine_hgnetv2.yml',
+]
+
+output_dir: ./output/dfine_hgnetv2_l_hierarchical_p2_e2
+model: DFINE
+criterion: HierarchicalDFINECriterion
+postprocessor: HierarchicalDFINEPostProcessor
+eval_spatial_size: [1024, 1024]
+
+DFINE: {backbone: HGNetv2, encoder: P2HybridEncoder, decoder: HierarchicalDFINETransformer}
+
+HGNetv2:
+  name: 'B4'
+  return_idx: [0, 1, 2, 3]
+  freeze_stem_only: True
+  freeze_at: 0
+  freeze_norm: True
+  pretrained: False
+
+# The inherited three-level encoder remains byte-for-byte compatible with the
+# baseline.  Only p2_input_proj and p2_fuse are new.
+P2HybridEncoder:
+  p2_in_channels: 128
+  p2_stride: 4
+  in_channels: [512, 1024, 2048]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  use_encoder_idx: [2]
+  num_encoder_layers: 1
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.
+  enc_act: 'gelu'
+  expansion: 1.0
+  depth_mult: 1
+  act: 'silu'
+
+HierarchicalDFINETransformer:
+  feat_channels: [256, 256, 256, 256]
+  feat_strides: [4, 8, 16, 32]
+  hidden_dim: 256
+  num_levels: 4
+  num_layers: 6
+  eval_idx: -1
+  num_queries: 300
+  num_denoising: 100
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+  reg_max: 32
+  reg_scale: 4
+  layer_scale: 1
+  # New P2 gets three sampling points; the old P3-P5 allocation is preserved.
+  num_points: [3, 3, 6, 3]
+  cross_attn_method: default
+  query_select_method: agnostic
+  # Keep initial proposals on P3-P5. P2 refines every decoder query through
+  # deformable attention without flooding top-k selection with 65K new anchors.
+  query_select_start_level: 1
+  # P2=.025, P3=.05, P4=.10, P5=.20: old P3-P5 priors stay unchanged.
+  anchor_grid_size: 0.025
+
+HierarchicalDFINECriterion:
+  weight_dict: {loss_defectness: 1, loss_class: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5}
+  losses: ['hierarchical', 'boxes', 'local']
+  alpha: 0.75
+  gamma: 2.0
+  reg_max: 32
+  class_label_smoothing: 0.05
+  class_focal_gamma: 1.0
+  class_weights: [0.645, 1.231, 1.138, 0.964, 0.943, 1.035, 0.533, 1.079, 1.433]
+  matcher:
+    type: HierarchicalHungarianMatcher
+    weight_dict: {cost_objectness: 2, cost_bbox: 5, cost_giou: 2}
+    alpha: 0.25
+    gamma: 2.0
+
+HierarchicalDFINEPostProcessor: {num_top_queries: 300, score_mode: objectness}
+
+optimizer:
+  type: AdamW
+  params:
+    - {params: '^(?=.*backbone)(?!.*norm|bn).*$', lr: 0.000003}
+    - {params: '^encoder\.p2_.*\.0\.weight$', lr: 0.0001875}
+    - {params: '^encoder\.p2_.*\.1\.(?:weight|bias)$', lr: 0.0001875, weight_decay: 0.}
+    - {params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$', weight_decay: 0.}
+    - {params: 'decoder.*class_(?:weight|bias)', lr: 0.00012}
+  # 480 steps at batch 18: old-parameter integrated update is approximately
+  # equal to the 310-step mild gate, while the new P2 branch learns faster.
+  lr: 0.00003
+  betas: [0.9, 0.999]
+  weight_decay: 0.000125
+
+# One gate epoch. Continue only if unified external evaluation is positive.
+epochs: 1
+print_freq: 20
+checkpoint_freq: 1
+train_dataloader:
+  # Real 1024 forward/backward peaks: batch16=38.25 GiB, batch18=43.02 GiB.
+  # Batch18 is the largest sensible setting on the 48 GiB server.
+  total_batch_size: 18
+  num_workers: 4
+  dataset:
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [1024, 1024]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        name: stop_epoch
+        epoch: 1
+        ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
+  collate_fn:
+    base_size: 1024
+    stop_epoch: 1
+    ema_restart_decay: 0.9999
+    base_size_repeat: ~
+
+val_dataloader:
+  total_batch_size: 8
+  num_workers: 4
+  dataset:
+    transforms:
+      ops:
+        - {type: Resize, size: [1024, 1024]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+
+ema: {decay: 0.9999, warmups: 1000}
+lr_warmup_scheduler: {warmup_duration: 0}

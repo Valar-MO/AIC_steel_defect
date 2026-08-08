@@ -1,0 +1,43 @@
+model:
+  backbone_weights: /root/autodl-tmp/weights/dinov2-small
+  detector_weights: /root/autodl-tmp/weights/rtdetr-r50vd-hf
+  selected_layers: [3, 6, 9, 12]
+  out_channels: 256
+  unfreeze_last_blocks: 0
+  num_classes: 9
+
+data:
+  yaml: /root/autodl-tmp/datasets/AIC_steel_defect_mixed/steel.yaml
+  image_size: 1008
+  horizontal_flip: 0.5
+  vertical_flip: 0.0
+  brightness: 0.10
+  contrast: 0.10
+
+training:
+  batch_size: 24
+  epochs: 50
+  workers: 8
+  head_learning_rate: 1.0e-4
+  backbone_learning_rate: 1.0e-5
+  weight_decay: 1.0e-4
+  grad_clip: 0.1
+  warmup_epochs: 1.0
+  patience: 10
+  min_delta: 0.01
+  save_every: 5
+  amp: true
+  amp_dtype: bfloat16
+
+experiment:
+  project: /root/autodl-tmp/runs/dinov2_rtdetr
+  name: dinov2_rtdetr_competition_v2
+  seed: 42
+
+validation:
+  manifest: splits/v1/split_manifest.csv
+  tile_size: 2048
+  overlap: 512
+  score_threshold: 0.05
+  nms_iou: 0.5
+  selection_metric: map50_95

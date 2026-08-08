@@ -1,0 +1,41 @@
+task: detection
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox']
+
+num_classes: 9
+remap_mscoco_category: False
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /root/autodl-tmp/datasets/AIC_steel_defect_mixed
+    ann_file: /root/autodl-tmp/datasets/AIC_steel_defect_mixed_coco_hierarchical/annotations/instances_train.json
+    return_masks: False
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: True
+  num_workers: 8
+  drop_last: True
+  collate_fn:
+    type: BatchImageCollateFunction
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /root/autodl-tmp/datasets/AIC_steel_defect_mixed
+    ann_file: /root/autodl-tmp/datasets/AIC_steel_defect_mixed_coco_hierarchical/annotations/instances_val.json
+    return_masks: False
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: False
+  num_workers: 8
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFunction
+

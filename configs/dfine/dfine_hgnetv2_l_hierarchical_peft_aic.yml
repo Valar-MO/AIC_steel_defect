@@ -1,0 +1,148 @@
+__include__: [
+  '../../../dataset/aic_hierarchical_detection.yml',
+  '../../../runtime.yml',
+  '../../include/dataloader.yml',
+  '../../include/optimizer.yml',
+  '../../include/dfine_hgnetv2.yml',
+]
+
+output_dir: ./output/dfine_hgnetv2_l_hierarchical_peft_aic_v2
+model: HierarchicalPEFTDFINE
+criterion: HierarchicalDFINECriterion
+postprocessor: HierarchicalDFINEPostProcessor
+eval_spatial_size: [1024, 1024]
+
+HierarchicalPEFTDFINE:
+  backbone: HGNetv2
+  encoder: HybridEncoder
+  decoder: HierarchicalDFINETransformer
+  train_decoder_norm: True
+  train_decoder_bias: False
+  train_bbox_head: True
+  train_encoder_objectness: True
+
+HGNetv2:
+  name: 'B4'
+  return_idx: [1, 2, 3]
+  freeze_stem_only: True
+  freeze_at: 0
+  freeze_norm: True
+  pretrained: False
+
+HierarchicalDFINETransformer:
+  feat_channels: [256, 256, 256]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  num_levels: 3
+  num_layers: 6
+  eval_idx: -1
+  num_queries: 300
+  num_denoising: 100
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+  reg_max: 32
+  reg_scale: 4
+  layer_scale: 1
+  num_points: [3, 6, 3]
+  cross_attn_method: default
+  query_select_method: agnostic
+  # Parallel AdaptFormer branch on every decoder FFN. Zero-initialized up
+  # projections make the migrated best_stg1 detector identical at step zero.
+  adapter_dim: 64
+  adapter_dropout: 0.05
+  adapter_scale: 0.1
+  adapter_learnable_scale: True
+  adapter_layers: [0, 1, 2, 3, 4, 5]
+
+HierarchicalDFINECriterion:
+  weight_dict: {loss_defectness: 1, loss_class: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5}
+  losses: ['hierarchical', 'boxes', 'local']
+  alpha: 0.75
+  gamma: 2.0
+  reg_max: 32
+  class_label_smoothing: 0.05
+  class_focal_gamma: 1.0
+  # sqrt(max_count / class_count), normalized to mean 1. These remain the
+  # conditional-class CE weights used by the established hierarchical model.
+  class_weights: [0.645, 1.231, 1.138, 0.964, 0.943, 1.035, 0.533, 1.079, 1.433]
+  # Reuse the same frequency signal more mildly for matched positive
+  # objectness. power=0.5 plus clamping avoids rare classes dominating QFL.
+  objectness_class_weights: [0.645, 1.231, 1.138, 0.964, 0.943, 1.035, 0.533, 1.079, 1.433]
+  objectness_class_weight_power: 0.5
+  objectness_class_weight_min: 0.75
+  objectness_class_weight_max: 1.25
+  # Exact mixed-train priors from 16,640 annotations. tau=0.2 is deliberately
+  # much milder than the usual tau=1 Balanced-Softmax/logit-adjustment setting.
+  class_priors: [0.20294471, 0.05570913, 0.06520433, 0.09092548, 0.09507212, 0.07884615, 0.29765625, 0.07253606, 0.04110577]
+  class_logit_adjustment_tau: 0.2
+  matcher:
+    type: HierarchicalHungarianMatcher
+    weight_dict: {cost_objectness: 2, cost_bbox: 5, cost_giou: 2}
+    alpha: 0.25
+    gamma: 2.0
+
+HierarchicalDFINEPostProcessor:
+  num_top_queries: 300
+  score_mode: objectness
+
+optimizer:
+  type: AdamW
+  params:
+    - {params: 'adaptformer', lr: 0.0003}
+    - {params: '(?:dec_score_head|enc_score_head)', lr: 0.0003}
+    - {params: '(?:dec_bbox_head|pre_bbox_head)', lr: 0.00001}
+  # Remaining trainable parameters are decoder LayerNorm tensors.
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.000125
+
+epochs: 15
+print_freq: 10
+# Preserve every epoch because the official solver chooses "best" by AP50:95,
+# while this experiment must later be selected from the full PR/recall curve.
+checkpoint_freq: 1
+train_dataloader:
+  # Empirically measured on the 48 GiB RTX 4090: batch 96 peaks at 34.30 GiB
+  # for a real 1024px forward/backward, leaving room for GT-count variation,
+  # CUDA caching and EMA state during the full trainer.
+  total_batch_size: 96
+  # Keep four workers. Full-epoch measurement is 6.33 s/step after startup;
+  # pressure tests with 8/16 workers were slower because each worker prepares
+  # an entire 96-image batch and concurrent 4K decoding/shared-memory transfer
+  # saturated the storage/memory path.
+  num_workers: 4
+  dataset:
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [1024, 1024]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy: {epoch: 12}
+  collate_fn:
+    base_size: 1024
+    # Keep the solver in one continuous stage for this short PEFT run.  Strong
+    # image augmentation still stops independently at epoch 12 above.
+    stop_epoch: 15
+    ema_restart_decay: 0.9999
+    base_size_repeat: ~
+
+val_dataloader:
+  total_batch_size: 4
+  num_workers: 4
+  dataset:
+    transforms:
+      ops:
+        - {type: Resize, size: [1024, 1024]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+
+# With only 1,350 optimizer steps, a fixed 0.9999 EMA would remain too close to
+# the initialization.  The official 1,000-step decay ramp tracks early PEFT
+# updates quickly and approaches 0.9999 only near the end.
+ema: {decay: 0.9999, warmups: 1000}
+lr_warmup_scheduler: {warmup_duration: 0}

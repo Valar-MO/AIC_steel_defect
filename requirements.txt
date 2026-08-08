@@ -1,0 +1,7 @@
+# PyTorch and torchvision are provided by the CUDA-specific Conda environment.
+transformers>=5.13,<6
+huggingface-hub>=0.36
+safetensors>=0.4
+scipy>=1.15,<2
+PyYAML>=6
+Pillow>=10

@@ -1,0 +1,53 @@
+# Competition data must never enter Git.
+/data/
+/datasets/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.xml
+*.zip
+*.tar
+*.tar.gz
+
+# Model artifacts and experiment outputs
+outputs/
+splits/
+runs/
+weights/
+checkpoints/
+wandb/
+mlruns/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+
+# Private evaluation artifacts and competition submissions.
+# These can contain image identifiers, labels, predictions, or test-set output.
+analysis/
+submissions/
+result_review/
+group_review/
+ft4_weak_class_diagnostics/
+ft4_weak_class_visualizations/
+coverage_by_class.csv
+coverage_by_threshold.csv
+tile_evaluation_report.json
+HANDOFF_*.md
+
+# Local configuration and caches
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.idea/
+.vscode/

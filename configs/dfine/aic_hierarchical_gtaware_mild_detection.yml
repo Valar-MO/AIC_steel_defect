@@ -1,0 +1,53 @@
+task: detection
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox']
+
+num_classes: 9
+remap_mscoco_category: False
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: GTAwareBatchMixDataset
+    # Mild E1.1: retain 85.7% base-domain exposure and use only the two
+    # classes that showed a positive signal in aggressive E1.
+    pattern: [base, base, base, qilie,
+              base, base, base, huashang,
+              base, base, base, base,
+              base, base, base, qilie,
+              base, base, base, huashang,
+              base, base, base, base,
+              base, base, base, base]
+    epoch_size: 8680
+    seed: 42
+    dataset:
+      type: CocoDetection
+      img_folder: /root/autodl-tmp/datasets/AIC_steel_defect_gtaware_e1
+      ann_file: /root/autodl-tmp/datasets/AIC_steel_defect_gtaware_e1/annotations/instances_train.json
+      return_masks: False
+      transforms:
+        type: Compose
+        ops: ~
+  shuffle: False
+  num_workers: 4
+  drop_last: True
+  collate_fn:
+    type: BatchImageCollateFunction
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /root/autodl-tmp/datasets/AIC_steel_defect_gtaware_e1
+    ann_file: /root/autodl-tmp/datasets/AIC_steel_defect_gtaware_e1/annotations/instances_val.json
+    return_masks: False
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: False
+  num_workers: 4
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFunction

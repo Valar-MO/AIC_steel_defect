@@ -1,0 +1,101 @@
+__include__: [
+  '../../../dataset/aic_hierarchical_joint_e1_fresh_detection.yml', '../../../runtime.yml',
+  '../../include/dataloader.yml', '../../include/optimizer.yml', '../../include/dfine_hgnetv2.yml',
+]
+
+# Joint-S1a: retain Joint-Fresh geometry/features and tune only final Selection.
+output_dir: ./output/dfine_hgnetv2_l_hierarchical_joint_s1a
+model: HierarchicalObjectnessRankingDFINE
+criterion: HierarchicalDFINECriterion
+postprocessor: HierarchicalDFINEPostProcessor
+eval_spatial_size: [1024, 1024]
+
+HierarchicalObjectnessRankingDFINE:
+  backbone: HGNetv2
+  encoder: HybridEncoder
+  decoder: HierarchicalDFINETransformer
+  train_all_decoder_objectness_heads: False
+
+HGNetv2: {name: 'B4', return_idx: [1, 2, 3], freeze_stem_only: True, freeze_at: 0, freeze_norm: True, pretrained: False}
+HierarchicalDFINETransformer:
+  feat_channels: [256, 256, 256]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  num_levels: 3
+  num_layers: 6
+  eval_idx: -1
+  num_queries: 300
+  num_denoising: 0
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+  reg_max: 32
+  reg_scale: 4
+  layer_scale: 1
+  num_points: [3, 6, 3]
+  cross_attn_method: default
+  query_select_method: agnostic
+
+HierarchicalDFINECriterion:
+  weight_dict:
+    loss_defectness: 1.0
+    loss_selection_native_positive: 0.25
+    loss_selection_native_hard_background_rank: 0.20
+    loss_selection_native_duplicate_rank: 0.05
+  losses: ['hierarchical']
+  alpha: 0.75
+  gamma: 2.0
+  reg_max: 32
+  class_label_smoothing: 0.05
+  class_focal_gamma: 1.0
+  class_weights: [0.645, 1.231, 1.138, 0.964, 0.943, 1.035, 0.533, 1.079, 1.433]
+  selection_native_ranking: True
+  selection_native_hard_background_topk: 5
+  selection_native_background_iou: 0.10
+  selection_native_positive_iou: 0.50
+  selection_native_duplicate_iou: 0.50
+  selection_native_duplicate_box_iou: 0.50
+  selection_native_rank_margin: 0.25
+  matcher:
+    type: HierarchicalHungarianMatcher
+    weight_dict: {cost_objectness: 2, cost_bbox: 5, cost_giou: 2}
+    alpha: 0.25
+    gamma: 2.0
+
+HierarchicalDFINEPostProcessor: {num_top_queries: 300, score_mode: objectness}
+optimizer:
+  type: AdamW
+  lr: 0.000025
+  betas: [0.9, 0.999]
+  weight_decay: 0.000125
+
+epochs: 8
+checkpoint_freq: 2
+print_freq: 50
+train_dataloader:
+  total_batch_size: 16
+  shuffle: False
+  num_workers: 4
+  drop_last: True
+  dataset:
+    epoch_size: 8192
+    dataset:
+      transforms:
+        type: Compose
+        ops:
+          - {type: RandomPhotometricDistort, p: 0.25}
+          - {type: RandomHorizontalFlip}
+          - {type: Resize, size: [1024, 1024]}
+          - {type: SanitizeBoundingBoxes, min_size: 1}
+          - {type: ConvertPILImage, dtype: 'float32', scale: True}
+          - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+  collate_fn: {base_size: 1024, stop_epoch: 8, ema_restart_decay: 0.9999, base_size_repeat: ~}
+val_dataloader:
+  total_batch_size: 8
+  dataset:
+    transforms:
+      type: Compose
+      ops:
+        - {type: Resize, size: [1024, 1024]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+ema: {warmups: 0}
+lr_warmup_scheduler: {warmup_duration: 0}
