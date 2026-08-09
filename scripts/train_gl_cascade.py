@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone-checkpointing", action="store_true")
     parser.add_argument("--pretrained-backbone", action="store_true")
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--stop-after-epoch", type=int,
+                        help="Cleanly stop after this one-based epoch while preserving the full planned scheduler horizon.")
     parser.add_argument("--validate-every", type=int, default=1)
     parser.add_argument("--val-workers", type=int, default=4)
     parser.add_argument("--limit-steps", type=int, help="Smoke-test only: stop early without changing data geometry.")
@@ -125,7 +127,10 @@ def main() -> None:
         start_epoch = int(checkpoint["epoch"]) + 1
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "train_config.json").write_text(json.dumps(vars(args), default=str, ensure_ascii=False, indent=2), encoding="utf-8")
-    for epoch in range(start_epoch, args.epochs):
+    end_epoch = min(args.epochs, args.stop_after_epoch or args.epochs)
+    if end_epoch < start_epoch:
+        raise ValueError(f"--stop-after-epoch={end_epoch} is before resumed epoch {start_epoch + 1}")
+    for epoch in range(start_epoch, end_epoch):
         model.train(); optimizer.zero_grad(set_to_none=True); running = {}
         for step, batch in enumerate(loader, start=1):
             local, global_image = batch["local"].to(device, non_blocking=True), batch["global"].to(device, non_blocking=True)
