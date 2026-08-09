@@ -23,9 +23,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--classes", type=Path, default=Path("configs/classes.yaml"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=12)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--accumulate", type=int, default=8)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--accumulate", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--backbone-lr-mult", type=float, default=.10)
     parser.add_argument("--weight-decay", type=float, default=.05)
@@ -94,8 +94,8 @@ def _validate(opt: argparse.Namespace, checkpoint: Path, epoch: int) -> dict:
 
 def main() -> None:
     args = parse_args()
-    if args.batch_size != 1:
-        raise ValueError("The first GL-Cascade run is deliberately batch-size 1; use --accumulate for its effective batch.")
+    if args.batch_size <= 0 or args.accumulate <= 0:
+        raise ValueError("batch-size and accumulate must be positive")
     if args.backbone == "r50_dcn" and not args.pretrained_backbone:
         raise ValueError("Refusing to train randomly initialized r50_dcn. Pass --pretrained-backbone or use internimage_s with its official checkpoint.")
     if args.backbone == "internimage_s" and not args.internimage_checkpoint.is_file():
