@@ -37,7 +37,7 @@ def main() -> None:
             if score < opt.score_threshold:
                 continue
             all_gt = [item for grouped in gt.values() for item in grouped.get(image_id, [])]
-            if max((box_iou(box_tensor(box), box_tensor(item)).item() for item in all_gt), default=0.) < .10:
+            if max((box_iou(box, item) for item in all_gt), default=0.) < .10:
                 background += 1
         ap50 = ap_101(outcomes, gt_count); ap50_values.append(ap50)
         per_class[name] = {**point, "ap50": ap50, "background_fp": background}
@@ -53,12 +53,6 @@ def main() -> None:
     opt.output.parent.mkdir(parents=True, exist_ok=True)
     opt.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"overall": report["overall"], "weak_class_recall": report["weak_class_recall"], "output": str(opt.output.resolve())}, ensure_ascii=False))
-
-
-def box_tensor(box):
-    import torch
-    return torch.tensor(box, dtype=torch.float32).unsqueeze(0)
-
 
 if __name__ == "__main__":
     main()
