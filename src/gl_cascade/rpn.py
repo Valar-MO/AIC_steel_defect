@@ -87,6 +87,22 @@ class ATSSAssigner:
                 replace = ious > best_iou[indices]
                 selected = indices[replace]
                 best_iou[selected], matched[selected], positive[selected] = ious[replace], gt_index, True
+        # A sub-stride or extremely thin GT can contain no anchor centre, in
+        # which case vanilla ATSS yields no RPN supervision at all.  Give every
+        # remaining GT one unused anchor, preferring IoU and then centre
+        # proximity as a deterministic tie-breaker.
+        assigned_gt = matched[matched >= 0].unique()
+        unmatched_gt = torch.arange(len(gt_boxes), device=anchors.device)[~torch.isin(torch.arange(len(gt_boxes), device=anchors.device), assigned_gt)]
+        for gt_index in unmatched_gt.tolist():
+            available = ~positive
+            if not available.any():
+                available = torch.ones_like(positive)
+            ious = box_iou(anchors, gt_boxes[gt_index:gt_index + 1]).squeeze(1)
+            distance = ((centres - gt_centres[gt_index]) ** 2).sum(dim=1)
+            quality = ious + 1e-6 / (1 + distance)
+            quality = quality.masked_fill(~available, float("-inf"))
+            selected = quality.argmax()
+            matched[selected], positive[selected] = gt_index, True
         weights = torch.ones(count, device=anchors.device)
         weights[positive] = visible[matched[positive]]
         ignored_boxes = targets.get("ignore_boxes")

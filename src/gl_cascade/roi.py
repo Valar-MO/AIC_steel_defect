@@ -168,7 +168,11 @@ class CascadeROIHeads(nn.Module):
 
     def forward(self, features: OrderedDict[str, torch.Tensor], proposals: list[torch.Tensor], image_size: tuple[int, int],
                 targets: list[dict[str, torch.Tensor]] | None = None) -> dict:
-        boxes = proposals
+        # Training-only GT injection gives every ROI stage a positive example
+        # while the RPN is still learning to propose tiny defects.  Inference
+        # remains strictly proposal-driven.
+        boxes = ([torch.cat((proposal, target["boxes"].detach()), dim=0) for proposal, target in zip(proposals, targets)]
+                 if self.training and targets is not None else proposals)
         losses: dict[str, torch.Tensor] = {}
         final = None
         for stage_index, (threshold, stage) in enumerate(zip(self.thresholds, self.stages), start=1):
@@ -206,7 +210,9 @@ class CascadeROIHeads(nn.Module):
         result, offset = [], 0
         for item in boxes:
             item_delta = delta[offset:offset + len(item)]
-            result.append(clip_boxes(decode_boxes(item, item_delta), *image_size))
+            # Cascade targets treat the previous stage's proposal geometry as
+            # fixed; later losses must not backpropagate through it.
+            result.append(clip_boxes(decode_boxes(item, item_delta), *image_size).detach())
             offset += len(item)
         return result
 

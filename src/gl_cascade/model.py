@@ -57,7 +57,8 @@ class GLCascadeDetector(nn.Module):
             offset += count
             if not count:
                 result.append({"boxes": boxes, "labels": boxes.new_zeros((0,), dtype=torch.long),
-                               "scores": boxes.new_zeros((0,)), "ranking_logits": boxes.new_zeros((0,))})
+                               "scores": boxes.new_zeros((0,)), "class_scores": boxes.new_zeros((0,)),
+                               "ranking_logits": boxes.new_zeros((0,))})
                 continue
             detection_scores, labels = logits.sigmoid().max(dim=1)
             # Foreground is an explicit veto, never multiplied into the score.
