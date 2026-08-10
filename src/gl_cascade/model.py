@@ -73,7 +73,11 @@ class GLCascadeDetector(nn.Module):
                 winning_logits = logits[torch.arange(count, device=logits.device), labels]
                 background_logits = logits[:, self.num_classes]
             # Foreground is an explicit veto, never multiplied into the score.
-            keep = foreground.sigmoid() >= .05
+            if self.classifier_mode == "legacy_eql":
+                keep = foreground.sigmoid() >= .05
+            else:
+                # A defect can only survive when it outranks the explicit background class.
+                keep = (probability.argmax(dim=1) != self.num_classes) & (foreground.sigmoid() >= .05)
             detection_scores, labels, boxes, quality = detection_scores[keep], labels[keep], boxes[keep], quality[keep]
             winning_logits = winning_logits[keep]
             if background_logits is None:
