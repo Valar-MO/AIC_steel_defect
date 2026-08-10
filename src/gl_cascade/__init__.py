@@ -1,6 +1,7 @@
 """Global-local cascade detector for AIC steel defects."""
 
-from .data import OfficialGridBalancedSampler, OfficialGridGlobalLocalDataset, gl_cascade_collate
+from .data import ClassAwareOfficialGridSampler, OfficialGridBalancedSampler, OfficialGridGlobalLocalDataset, gl_cascade_collate
 from .model import GLCascadeDetector, GLCascadeOutput
 
-__all__ = ["GLCascadeDetector", "GLCascadeOutput", "OfficialGridBalancedSampler", "OfficialGridGlobalLocalDataset", "gl_cascade_collate"]
+__all__ = ["GLCascadeDetector", "GLCascadeOutput", "ClassAwareOfficialGridSampler", "OfficialGridBalancedSampler",
+           "OfficialGridGlobalLocalDataset", "gl_cascade_collate"]

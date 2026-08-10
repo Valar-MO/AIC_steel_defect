@@ -6,6 +6,36 @@ from torch import nn
 from torch.nn import functional as F
 
 
+class ClassBalancedFocalSoftmaxLoss(nn.Module):
+    """Mutually exclusive ROI classification with an explicit background class.
+
+    The defect weights are deliberately capped.  They compensate for the
+    long tail without removing the gradient that distinguishes a defect from
+    the other defects or from background.
+    """
+
+    def __init__(self, num_defect_classes: int, defect_counts: list[int] | None = None,
+                 gamma: float = 1.0, max_defect_weight: float = 2.5):
+        super().__init__()
+        counts = torch.tensor(defect_counts or [1] * num_defect_classes, dtype=torch.float32).clamp_min(1)
+        reference = counts.median()
+        defect_weights = (reference / counts).sqrt().clamp(min=1 / max_defect_weight, max=max_defect_weight)
+        self.gamma = gamma
+        self.register_buffer("class_weights", torch.cat((defect_weights, torch.ones(1))))
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, sample_weights: torch.Tensor) -> torch.Tensor:
+        valid = sample_weights > 0
+        if not valid.any():
+            return logits.sum() * 0
+        logits, targets, sample_weights = logits[valid], targets[valid], sample_weights[valid]
+        log_probability = F.log_softmax(logits, dim=1)
+        log_pt = log_probability.gather(1, targets[:, None]).squeeze(1)
+        pt = log_pt.exp()
+        weights = sample_weights * self.class_weights[targets]
+        loss = -(1 - pt).pow(self.gamma) * log_pt * weights
+        return loss.sum() / weights.sum().clamp_min(1)
+
+
 class EQLv2Loss(nn.Module):
     """EQLv2 equalization for nine sigmoid class logits.
 

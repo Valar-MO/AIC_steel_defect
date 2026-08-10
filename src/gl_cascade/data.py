@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from torch.utils.data import Dataset, WeightedRandomSampler
+from torch.utils.data import Dataset, Sampler, WeightedRandomSampler
 from torchvision.transforms.functional import InterpolationMode, normalize, pil_to_tensor, resize
 import yaml
 
@@ -161,3 +161,35 @@ class OfficialGridBalancedSampler(WeightedRandomSampler):
         super().__init__(weights, len(weights), replacement=True, generator=generator)
         self.class_tile_counts = counts.to(torch.long).tolist()
         self.empty_fraction = empty_fraction
+
+
+class ClassAwareOfficialGridSampler(Sampler[int]):
+    """Sample empty tiles at a fixed rate and positive tiles by target class.
+
+    Each positive draw first chooses one of the nine defect classes uniformly,
+    then a tile containing that class.  This controls class exposure directly
+    instead of hoping a per-tile scalar weight balances ROI instances.
+    """
+
+    def __init__(self, dataset: OfficialGridGlobalLocalDataset, empty_fraction: float = .55,
+                 seed: int = 20260810):
+        if not 0 < empty_fraction < 1:
+            raise ValueError("empty_fraction must be in (0, 1)")
+        self.empty_fraction, self.num_samples = empty_fraction, len(dataset)
+        self.empty_indices = [index for index, labels in enumerate(dataset.tile_labels) if not labels]
+        self.class_indices = [[index for index, labels in enumerate(dataset.tile_labels) if class_id in labels]
+                              for class_id in range(9)]
+        if not self.empty_indices or any(not items for items in self.class_indices):
+            raise ValueError("Class-aware sampler requires empty tiles and at least one tile for every defect class")
+        self.generator = torch.Generator().manual_seed(seed)
+
+    def __iter__(self):
+        for _ in range(self.num_samples):
+            if torch.rand((), generator=self.generator).item() < self.empty_fraction:
+                choices = self.empty_indices
+            else:
+                choices = self.class_indices[int(torch.randint(9, (), generator=self.generator))]
+            yield choices[int(torch.randint(len(choices), (), generator=self.generator))]
+
+    def __len__(self) -> int:
+        return self.num_samples

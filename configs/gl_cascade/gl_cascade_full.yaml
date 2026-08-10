@@ -36,7 +36,9 @@ architecture:
 loss:
   proposal_objectness: focal
   proposal_box: giou
-  class_long_tail: eqlv2
+  class_long_tail: class_balanced_softmax_focal
+  background_is_explicit_class: true
+  eqlv2: removed_after_e8_audit_negative_weight_collapse
   quality_is_centered_ranking_residual: true
 
 inference:

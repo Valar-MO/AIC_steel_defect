@@ -44,7 +44,8 @@ def main() -> None:
     train_args = checkpoint.get("args", {})
     model = GLCascadeDetector(backbone_name=train_args.get("backbone", "r50_dcn"), pretrained_backbone=False,
                               internimage_root=train_args.get("internimage_root"),
-                              backbone_checkpointing=bool(train_args.get("backbone_checkpointing", False))).to(device)
+                              backbone_checkpointing=bool(train_args.get("backbone_checkpointing", False)),
+                              classifier_mode=train_args.get("classifier_mode", "legacy_eql")).to(device)
     model.load_state_dict(checkpoint["model"], strict=True); model.eval()
     records = []
     with torch.inference_mode():

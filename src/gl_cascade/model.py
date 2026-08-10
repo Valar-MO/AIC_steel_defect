@@ -25,13 +25,16 @@ class GLCascadeDetector(nn.Module):
 
     def __init__(self, num_classes: int = 9, backbone_name: str = "r50_dcn", pretrained_backbone: bool = True,
                  internimage_root: str | None = None, internimage_checkpoint: str | None = None,
-                 backbone_checkpointing: bool = False, ranking_quality_weight: float = .25):
+                 backbone_checkpointing: bool = False, ranking_quality_weight: float = .25,
+                 classifier_mode: str = "softmax_background", defect_class_counts: list[int] | None = None):
         super().__init__()
         self.backbone = build_backbone(backbone_name, pretrained=pretrained_backbone, internimage_root=internimage_root,
                                        internimage_checkpoint=internimage_checkpoint, with_checkpointing=backbone_checkpointing)
         self.fpn = GlobalLocalFPN(self.backbone.out_channels)
         self.rpn = ATSSRPN()
-        self.roi_heads = CascadeROIHeads(num_classes=num_classes)
+        self.num_classes, self.classifier_mode = num_classes, classifier_mode
+        self.roi_heads = CascadeROIHeads(num_classes=num_classes, classifier_mode=classifier_mode,
+                                         defect_class_counts=defect_class_counts)
         self.ranking_quality_weight = ranking_quality_weight
 
     def forward(self, local: torch.Tensor, global_image: torch.Tensor, view_xyxy: torch.Tensor,
@@ -60,10 +63,22 @@ class GLCascadeDetector(nn.Module):
                                "scores": boxes.new_zeros((0,)), "class_scores": boxes.new_zeros((0,)),
                                "ranking_logits": boxes.new_zeros((0,))})
                 continue
-            detection_scores, labels = logits.sigmoid().max(dim=1)
+            if self.classifier_mode == "legacy_eql":
+                detection_scores, labels = logits.sigmoid().max(dim=1)
+                winning_logits, background_logits = logits[torch.arange(count, device=logits.device), labels], None
+            else:
+                probability = logits.softmax(dim=1)
+                defect_probability = probability[:, :self.num_classes]
+                detection_scores, labels = defect_probability.max(dim=1)
+                winning_logits = logits[torch.arange(count, device=logits.device), labels]
+                background_logits = logits[:, self.num_classes]
             # Foreground is an explicit veto, never multiplied into the score.
             keep = foreground.sigmoid() >= .05
-            detection_scores, labels, boxes, logits, quality = detection_scores[keep], labels[keep], boxes[keep], logits[keep], quality[keep]
-            ranking = logits[torch.arange(len(labels), device=labels.device), labels] + self.ranking_quality_weight * torch.tanh(quality)
+            detection_scores, labels, boxes, quality = detection_scores[keep], labels[keep], boxes[keep], quality[keep]
+            winning_logits = winning_logits[keep]
+            if background_logits is None:
+                ranking = winning_logits + self.ranking_quality_weight * torch.tanh(quality)
+            else:
+                ranking = winning_logits - background_logits[keep] + self.ranking_quality_weight * torch.tanh(quality)
             result.append(classwise_soft_nms(boxes, labels, detection_scores, ranking))
         return result

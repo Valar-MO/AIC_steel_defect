@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.gl_cascade import GLCascadeDetector, OfficialGridBalancedSampler, OfficialGridGlobalLocalDataset, gl_cascade_collate
+from src.gl_cascade import ClassAwareOfficialGridSampler, GLCascadeDetector, OfficialGridBalancedSampler, OfficialGridGlobalLocalDataset, gl_cascade_collate
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=float, default=1.0)
     parser.add_argument("--min-lr-mult", type=float, default=.05)
     parser.add_argument("--empty-fraction", type=float, default=.55)
+    parser.add_argument("--sampler", choices=("class_aware", "legacy_balanced"), default="class_aware")
+    parser.add_argument("--classifier-mode", choices=("softmax_background",), default="softmax_background")
     parser.add_argument("--global-input-size", type=int, default=1024)
     parser.add_argument("--local-input-size", type=int, default=1536)
     parser.add_argument("--backbone", choices=("internimage_s", "r50_dcn"), default="internimage_s")
@@ -40,6 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone-checkpointing", action="store_true")
     parser.add_argument("--pretrained-backbone", action="store_true")
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--init-from", type=Path,
+                        help="Warm-start compatible geometry weights while resetting classifier and optimizer state.")
+    parser.add_argument("--freeze-geometry-epochs", type=int, default=1,
+                        help="With --init-from, freeze backbone/FPN/RPN for these initial epochs.")
     parser.add_argument("--stop-after-epoch", type=int,
                         help="Cleanly stop after this one-based epoch while preserving the full planned scheduler horizon.")
     parser.add_argument("--validate-every", type=int, default=1)
@@ -80,6 +86,35 @@ def _scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_steps:
     return torch.optim.lr_scheduler.LambdaLR(optimizer, scale)
 
 
+def _defect_instance_counts(dataset: OfficialGridGlobalLocalDataset) -> list[int]:
+    counts = torch.zeros(9, dtype=torch.long)
+    for labels in dataset.tile_labels:
+        for label in labels:
+            counts[label] += 1
+    return counts.tolist()
+
+
+def _load_geometry_warm_start(model: GLCascadeDetector, checkpoint_path: Path) -> dict[str, int]:
+    source = torch.load(checkpoint_path, map_location="cpu", weights_only=False)["model"]
+    target = model.state_dict()
+    classifier_prefix = "roi_heads.stages."
+    loadable = {
+        key: value for key, value in source.items()
+        if key in target and target[key].shape == value.shape
+        and not (key.startswith(classifier_prefix) and ".class_logits." in key)
+        and not key.startswith("roi_heads.eql.")
+        and not key.startswith("roi_heads.pair.")
+    }
+    missing, unexpected = model.load_state_dict(loadable, strict=False)
+    return {"loaded": len(loadable), "missing": len(missing), "unexpected": len(unexpected)}
+
+
+def _set_geometry_trainable(model: GLCascadeDetector, trainable: bool) -> None:
+    for module in (model.backbone, model.fpn, model.rpn):
+        for parameter in module.parameters():
+            parameter.requires_grad_(trainable)
+
+
 def _validate(opt: argparse.Namespace, checkpoint: Path, epoch: int) -> dict:
     epoch_dir = opt.output_dir / "val" / f"epoch_{epoch:02d}"
     predictions, report = epoch_dir / "merged_predictions.json", epoch_dir / "report.json"
@@ -98,6 +133,8 @@ def main() -> None:
     args = parse_args()
     if args.batch_size <= 0 or args.accumulate <= 0:
         raise ValueError("batch-size and accumulate must be positive")
+    if args.resume and args.init_from:
+        raise ValueError("--resume and --init-from are mutually exclusive")
     if args.backbone == "r50_dcn" and not args.pretrained_backbone:
         raise ValueError("Refusing to train randomly initialized r50_dcn. Pass --pretrained-backbone or use internimage_s with its official checkpoint.")
     if args.backbone == "internimage_s" and not args.internimage_checkpoint.is_file():
@@ -105,13 +142,15 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = OfficialGridGlobalLocalDataset(args.manifest, args.classes, split="train", global_input_size=args.global_input_size,
                                              local_input_size=args.local_input_size)
-    sampler = OfficialGridBalancedSampler(dataset, empty_fraction=args.empty_fraction)
+    sampler = (ClassAwareOfficialGridSampler(dataset, empty_fraction=args.empty_fraction)
+               if args.sampler == "class_aware" else OfficialGridBalancedSampler(dataset, empty_fraction=args.empty_fraction))
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.workers, pin_memory=device.type == "cuda",
                         persistent_workers=args.workers > 0, collate_fn=gl_cascade_collate)
     use_pretrained = args.pretrained_backbone or args.backbone == "internimage_s"
     model = GLCascadeDetector(backbone_name=args.backbone, pretrained_backbone=use_pretrained,
                               internimage_root=str(args.internimage_root), internimage_checkpoint=str(args.internimage_checkpoint),
-                              backbone_checkpointing=args.backbone_checkpointing).to(device)
+                              backbone_checkpointing=args.backbone_checkpointing, classifier_mode=args.classifier_mode,
+                              defect_class_counts=_defect_instance_counts(dataset)).to(device)
     optimizer = torch.optim.AdamW(_parameter_groups(model, args.learning_rate, args.backbone_lr_mult, use_pretrained),
                                   weight_decay=args.weight_decay)
     optimizer_steps_per_epoch = math.ceil(len(loader) / args.accumulate)
@@ -125,12 +164,19 @@ def main() -> None:
         if "scheduler" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = int(checkpoint["epoch"]) + 1
+    warm_start = _load_geometry_warm_start(model, args.init_from) if args.init_from else None
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "train_config.json").write_text(json.dumps(vars(args), default=str, ensure_ascii=False, indent=2), encoding="utf-8")
     end_epoch = min(args.epochs, args.stop_after_epoch or args.epochs)
     if end_epoch < start_epoch:
         raise ValueError(f"--stop-after-epoch={end_epoch} is before resumed epoch {start_epoch + 1}")
+    geometry_frozen = None
     for epoch in range(start_epoch, end_epoch):
+        should_freeze = bool(args.init_from and epoch < args.freeze_geometry_epochs)
+        if should_freeze != geometry_frozen:
+            _set_geometry_trainable(model, not should_freeze)
+            geometry_frozen = should_freeze
+            print(json.dumps({"epoch": epoch + 1, "geometry_frozen": geometry_frozen, "warm_start": warm_start}, ensure_ascii=False), flush=True)
         model.train(); optimizer.zero_grad(set_to_none=True); running = {}
         for step, batch in enumerate(loader, start=1):
             local, global_image = batch["local"].to(device, non_blocking=True), batch["global"].to(device, non_blocking=True)

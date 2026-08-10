@@ -11,7 +11,7 @@ from torchvision.ops import roi_align
 
 from .backbone import group_norm
 from .boxes import box_iou, clip_boxes, decode_boxes, encode_boxes
-from .losses import EQLv2Loss, quality_loss
+from .losses import ClassBalancedFocalSoftmaxLoss, EQLv2Loss, quality_loss
 
 
 FPN_LEVELS = ("P2", "P3", "P4", "P5", "P6")
@@ -86,13 +86,13 @@ class ShapeROIExtractor(nn.Module):
 
 
 class CascadeStage(nn.Module):
-    def __init__(self, channels: int, num_classes: int):
+    def __init__(self, channels: int, class_output_classes: int):
         super().__init__()
         self.general = MultiScaleROIExtractor((7, 7))
         self.shape = ShapeROIExtractor(channels)
         self.general_projection = nn.Sequential(nn.Flatten(), nn.Linear(channels * 49, 1024), nn.GELU(), nn.Dropout(.1))
         self.fusion = nn.Sequential(nn.Linear(1024 + channels + 4, 1024), nn.GELU(), nn.Dropout(.1))
-        self.class_logits = nn.Linear(1024, num_classes)
+        self.class_logits = nn.Linear(1024, class_output_classes)
         self.foreground = nn.Linear(1024, 1)
         self.box_delta = nn.Linear(1024, 4)
         self.quality = nn.Linear(1024, 1)
@@ -135,12 +135,20 @@ class QilieJiebaResidual(nn.Module):
 class CascadeROIHeads(nn.Module):
     thresholds = (.50, .55, .60)
 
-    def __init__(self, num_classes: int, channels: int = 256, samples_per_image: int = 512, positive_fraction: float = .25):
+    def __init__(self, num_classes: int, channels: int = 256, samples_per_image: int = 512, positive_fraction: float = .25,
+                 classifier_mode: str = "softmax_background", defect_class_counts: list[int] | None = None):
         super().__init__()
+        if classifier_mode not in {"legacy_eql", "softmax_background"}:
+            raise ValueError(f"Unsupported classifier mode: {classifier_mode}")
         self.num_classes, self.samples_per_image, self.positive_fraction = num_classes, samples_per_image, positive_fraction
-        self.stages = nn.ModuleList([CascadeStage(channels, num_classes) for _ in self.thresholds])
-        self.eql = EQLv2Loss(num_classes)
-        self.pair = QilieJiebaResidual(1024, qilie_index=2, jieba_index=0)
+        self.classifier_mode, self.background_index = classifier_mode, num_classes
+        output_classes = num_classes if classifier_mode == "legacy_eql" else num_classes + 1
+        self.stages = nn.ModuleList([CascadeStage(channels, output_classes) for _ in self.thresholds])
+        if classifier_mode == "legacy_eql":
+            self.eql = EQLv2Loss(num_classes)
+            self.pair = QilieJiebaResidual(1024, qilie_index=2, jieba_index=0)
+        else:
+            self.class_loss = ClassBalancedFocalSoftmaxLoss(num_classes, defect_class_counts)
 
     def _assign(self, boxes: torch.Tensor, target: dict[str, torch.Tensor], threshold: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if not len(target["boxes"]):
@@ -187,7 +195,7 @@ class CascadeROIHeads(nn.Module):
                 train_boxes = sampled_boxes
             output = stage(features, train_boxes)
             force_pair = None
-            if assignments is not None:
+            if self.classifier_mode == "legacy_eql" and assignments is not None:
                 label_parts = []
                 for target, (matched, positive, _, _) in zip(targets, assignments):
                     part = torch.full_like(matched, -2)
@@ -196,7 +204,8 @@ class CascadeROIHeads(nn.Module):
                     label_parts.append(part)
                 labels = torch.cat(label_parts)
                 force_pair = (labels == 2) | (labels == 0)
-            output["class_logits"] = self.pair(output["class_logits"], output["embedding"], force_pair)
+            if self.classifier_mode == "legacy_eql":
+                output["class_logits"] = self.pair(output["class_logits"], output["embedding"], force_pair)
             refined = self._split_and_refine(train_boxes, output["box_delta"], image_size)
             if assignments is not None:
                 self._losses(losses, stage_index, output, train_boxes, targets, assignments)
@@ -220,7 +229,7 @@ class CascadeROIHeads(nn.Module):
                 targets: list[dict[str, torch.Tensor]], assignments: list[tuple[torch.Tensor, ...]]) -> None:
         labels, foreground, target_boxes, ious, weights = [], [], [], [], []
         for target, (matched, positive, matched_iou, weight) in zip(targets, assignments):
-            class_labels = torch.full_like(matched, -2)
+            class_labels = torch.full_like(matched, -2 if self.classifier_mode == "legacy_eql" else self.background_index)
             if len(target["labels"]):
                 class_labels[positive] = target["labels"][matched[positive]]
             labels.append(class_labels)
@@ -228,8 +237,12 @@ class CascadeROIHeads(nn.Module):
             target_boxes.append(target["boxes"][matched.clamp(min=0)] if len(target["boxes"]) else target["boxes"].new_zeros((len(matched), 4)))
             ious.append(matched_iou); weights.append(weight)
         labels, foreground, target_boxes, ious, weights = map(torch.cat, (labels, foreground, target_boxes, ious, weights))
-        losses[f"roi{stage}_class"] = self.eql(output["class_logits"], labels, weights)
-        losses[f"roi{stage}_foreground"] = F.binary_cross_entropy_with_logits(output["foreground"], foreground, reduction="none").mul(weights).sum() / weights.sum().clamp(min=1)
+        if self.classifier_mode == "legacy_eql":
+            losses[f"roi{stage}_class"] = self.eql(output["class_logits"], labels, weights)
+        else:
+            losses[f"roi{stage}_class"] = self.class_loss(output["class_logits"], labels, weights)
+        foreground_loss = F.binary_cross_entropy_with_logits(output["foreground"], foreground, reduction="none").mul(weights).sum() / weights.sum().clamp(min=1)
+        losses[f"roi{stage}_foreground"] = foreground_loss if self.classifier_mode == "legacy_eql" else .25 * foreground_loss
         positive = foreground.bool()
         references = torch.cat(sampled_boxes)
         if positive.any():

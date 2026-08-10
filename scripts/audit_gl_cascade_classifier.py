@@ -60,6 +60,10 @@ def sampler_exposure(dataset: OfficialGridGlobalLocalDataset, class_names: list[
 
 
 def eql_state(state_dict: dict[str, torch.Tensor], class_names: list[str]) -> dict:
+    if "roi_heads.eql.positive_grad" not in state_dict:
+        weights = state_dict["roi_heads.class_loss.class_weights"].tolist()
+        return {"mode": "softmax_background", "class_weights": {"background": weights[-1],
+                **{name: weights[index] for index, name in enumerate(class_names)}}}
     positive = state_dict["roi_heads.eql.positive_grad"].double()
     negative = state_dict["roi_heads.eql.negative_grad"].double()
     ratio = positive / negative.clamp_min(1e-6)
@@ -144,7 +148,8 @@ def main() -> None:
                                                  global_input_size=opt.global_input_size, local_input_size=opt.local_input_size)
     model = GLCascadeDetector(backbone_name=train_args.get("backbone", "r50_dcn"), pretrained_backbone=False,
                               internimage_root=train_args.get("internimage_root"),
-                              backbone_checkpointing=bool(train_args.get("backbone_checkpointing", False))).to(device)
+                              backbone_checkpointing=bool(train_args.get("backbone_checkpointing", False)),
+                              classifier_mode=train_args.get("classifier_mode", "legacy_eql")).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     report = {
         "checkpoint": str(opt.checkpoint.resolve()),

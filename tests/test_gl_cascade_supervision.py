@@ -10,6 +10,7 @@ try:
     import torch
     from src.gl_cascade.merge import map_tile_to_original
     from src.gl_cascade.postprocess import classwise_soft_nms
+    from src.gl_cascade.data import ClassAwareOfficialGridSampler
     from src.gl_cascade.roi import CascadeROIHeads
     from src.gl_cascade.rpn import ATSSAssigner, AnchorGenerator
 except ImportError:  # pragma: no cover - keeps CPU-only utility environments usable.
@@ -54,7 +55,20 @@ class GLCascadeSupervisionTest(unittest.TestCase):
         head = CascadeROIHeads(num_classes=9).train()
         output = head(features, [torch.zeros((0, 4))], (128, 128), [target])
         self.assertEqual(len(output["boxes"][0]), 1)
+        self.assertEqual(output["final"]["class_logits"].shape[1], 10)
         self.assertTrue(torch.isfinite(sum(output["losses"].values())))
+
+    def test_class_aware_sampler_has_fixed_empty_rate_and_class_targets(self):
+        class Dataset:
+            tile_labels = [(), (0,), (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+
+            def __len__(self):
+                return len(self.tile_labels)
+
+        sampler = ClassAwareOfficialGridSampler(Dataset(), empty_fraction=.5, seed=3)
+        draws = list(sampler)
+        self.assertEqual(len(draws), 10)
+        self.assertTrue(all(0 <= index < 10 for index in draws))
 
 
 if __name__ == "__main__":
