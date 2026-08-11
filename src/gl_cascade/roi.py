@@ -11,7 +11,7 @@ from torchvision.ops import roi_align
 
 from .backbone import group_norm
 from .boxes import box_iou, clip_boxes, decode_boxes, encode_boxes
-from .losses import ClassBalancedFocalSoftmaxLoss, EQLv2Loss, quality_loss
+from .losses import ClassBalancedFocalSoftmaxLoss, EQLv2Loss, quality_loss, roi_background_margin_losses
 
 
 FPN_LEVELS = ("P2", "P3", "P4", "P5", "P6")
@@ -136,12 +136,20 @@ class CascadeROIHeads(nn.Module):
     thresholds = (.50, .55, .60)
 
     def __init__(self, num_classes: int, channels: int = 256, samples_per_image: int = 512, positive_fraction: float = .25,
-                 classifier_mode: str = "softmax_background", defect_class_counts: list[int] | None = None):
+                 classifier_mode: str = "softmax_background", defect_class_counts: list[int] | None = None,
+                 r3a_enabled: bool = False, r3a_keep_weight: float = .35, r3a_class_weight: float = .15,
+                 r3a_hard_background_weight: float = .10, r3a_positive_margin: float = .40,
+                 r3a_class_margin: float = .20, r3a_background_margin: float = .20, r3a_hard_background_topk: int = 3):
         super().__init__()
         if classifier_mode not in {"legacy_eql", "softmax_background"}:
             raise ValueError(f"Unsupported classifier mode: {classifier_mode}")
         self.num_classes, self.samples_per_image, self.positive_fraction = num_classes, samples_per_image, positive_fraction
         self.classifier_mode, self.background_index = classifier_mode, num_classes
+        self.r3a_enabled = r3a_enabled
+        self.r3a_keep_weight, self.r3a_class_weight = r3a_keep_weight, r3a_class_weight
+        self.r3a_hard_background_weight = r3a_hard_background_weight
+        self.r3a_positive_margin, self.r3a_class_margin = r3a_positive_margin, r3a_class_margin
+        self.r3a_background_margin, self.r3a_hard_background_topk = r3a_background_margin, r3a_hard_background_topk
         output_classes = num_classes if classifier_mode == "legacy_eql" else num_classes + 1
         self.stages = nn.ModuleList([CascadeStage(channels, output_classes) for _ in self.thresholds])
         if classifier_mode == "legacy_eql":
@@ -227,8 +235,8 @@ class CascadeROIHeads(nn.Module):
 
     def _losses(self, losses: dict[str, torch.Tensor], stage: int, output: dict[str, torch.Tensor], sampled_boxes: list[torch.Tensor],
                 targets: list[dict[str, torch.Tensor]], assignments: list[tuple[torch.Tensor, ...]]) -> None:
-        labels, foreground, target_boxes, ious, weights = [], [], [], [], []
-        for target, (matched, positive, matched_iou, weight) in zip(targets, assignments):
+        labels, foreground, target_boxes, ious, weights, image_indices = [], [], [], [], [], []
+        for image_index, (target, (matched, positive, matched_iou, weight)) in enumerate(zip(targets, assignments)):
             class_labels = torch.full_like(matched, -2 if self.classifier_mode == "legacy_eql" else self.background_index)
             if len(target["labels"]):
                 class_labels[positive] = target["labels"][matched[positive]]
@@ -236,11 +244,21 @@ class CascadeROIHeads(nn.Module):
             foreground.append(positive.to(torch.float32))
             target_boxes.append(target["boxes"][matched.clamp(min=0)] if len(target["boxes"]) else target["boxes"].new_zeros((len(matched), 4)))
             ious.append(matched_iou); weights.append(weight)
-        labels, foreground, target_boxes, ious, weights = map(torch.cat, (labels, foreground, target_boxes, ious, weights))
+            image_indices.append(torch.full((len(matched),), image_index, dtype=torch.long, device=matched.device))
+        labels, foreground, target_boxes, ious, weights, image_indices = map(torch.cat, (labels, foreground, target_boxes, ious, weights, image_indices))
         if self.classifier_mode == "legacy_eql":
             losses[f"roi{stage}_class"] = self.eql(output["class_logits"], labels, weights)
         else:
             losses[f"roi{stage}_class"] = self.class_loss(output["class_logits"], labels, weights)
+            if self.r3a_enabled and stage == len(self.thresholds):
+                margins = roi_background_margin_losses(
+                    output["class_logits"], labels, ious, weights, image_indices, self.background_index,
+                    self.class_loss.class_weights, positive_iou=self.thresholds[-1],
+                    positive_margin=self.r3a_positive_margin, class_margin=self.r3a_class_margin,
+                    background_margin=self.r3a_background_margin, hard_background_topk=self.r3a_hard_background_topk)
+                losses[f"roi{stage}_keep_margin"] = self.r3a_keep_weight * margins["keep_margin"]
+                losses[f"roi{stage}_class_margin"] = self.r3a_class_weight * margins["class_margin"]
+                losses[f"roi{stage}_hard_background"] = self.r3a_hard_background_weight * margins["hard_background"]
         foreground_loss = F.binary_cross_entropy_with_logits(output["foreground"], foreground, reduction="none").mul(weights).sum() / weights.sum().clamp(min=1)
         losses[f"roi{stage}_foreground"] = foreground_loss if self.classifier_mode == "legacy_eql" else .25 * foreground_loss
         positive = foreground.bool()

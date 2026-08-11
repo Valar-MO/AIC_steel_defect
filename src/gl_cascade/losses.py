@@ -36,6 +36,63 @@ class ClassBalancedFocalSoftmaxLoss(nn.Module):
         return loss.sum() / weights.sum().clamp_min(1)
 
 
+def roi_background_margin_losses(logits: torch.Tensor, labels: torch.Tensor, matched_iou: torch.Tensor,
+                                 sample_weights: torch.Tensor, image_indices: torch.Tensor, background_index: int,
+                                 class_weights: torch.Tensor, positive_iou: float = .60,
+                                 min_visible_fraction: float = .70, positive_margin: float = .40,
+                                 class_margin: float = .20, background_margin: float = .20,
+                                 hard_background_topk: int = 3) -> dict[str, torch.Tensor]:
+    """Margins for final-stage hard positives and genuinely confusing backgrounds.
+
+    The caller supplies only sampled RoIs.  Positives are deliberately limited
+    to reliable, sufficiently visible final-stage matches, while backgrounds
+    are mined independently inside each tile to avoid easy negatives
+    overwhelming the classification boundary.
+    """
+    zero = logits.sum() * 0
+    result = {"keep_margin": zero, "class_margin": zero, "hard_background": zero}
+    if not len(logits):
+        return result
+
+    positive = ((labels >= 0) & (labels < background_index) & (matched_iou >= positive_iou)
+                & (sample_weights >= min_visible_fraction))
+    if positive.any():
+        positive_indices = torch.where(positive)[0]
+        true_logits = logits[positive_indices, labels[positive_indices]]
+        background_logits = logits[positive_indices, background_index]
+        positive_weights = sample_weights[positive_indices] * class_weights[labels[positive_indices]]
+
+        background_gap = true_logits - background_logits
+        hard_keep = background_gap < positive_margin
+        if hard_keep.any():
+            keep_loss = F.softplus(positive_margin - background_gap[hard_keep]) * positive_weights[hard_keep]
+            result["keep_margin"] = keep_loss.sum() / positive_weights[hard_keep].sum().clamp_min(1)
+
+        defect_logits = logits[positive_indices, :background_index].clone()
+        defect_logits[torch.arange(len(positive_indices), device=logits.device), labels[positive_indices]] = float("-inf")
+        competing_gap = true_logits - defect_logits.max(dim=1).values
+        hard_class = competing_gap < class_margin
+        if hard_class.any():
+            pair_loss = F.softplus(class_margin - competing_gap[hard_class]) * positive_weights[hard_class]
+            result["class_margin"] = pair_loss.sum() / positive_weights[hard_class].sum().clamp_min(1)
+
+    # Use true background only.  Stage-3's ordinary negative pool includes
+    # near-matches; those should not be trained as texture-background vetoes.
+    background = (labels == background_index) & (matched_iou < .10) & (sample_weights > 0)
+    if not background.any():
+        return result
+    hard_indices = []
+    for image_index in image_indices[background].unique(sorted=True):
+        candidates = torch.where(background & (image_indices == image_index))[0]
+        hardness = logits[candidates, :background_index].max(dim=1).values - logits[candidates, background_index]
+        hard_indices.append(candidates[hardness.topk(min(hard_background_topk, len(candidates))).indices])
+    hard_indices = torch.cat(hard_indices)
+    hardness = logits[hard_indices, :background_index].max(dim=1).values - logits[hard_indices, background_index]
+    hard_loss = F.softplus(background_margin + hardness) * sample_weights[hard_indices]
+    result["hard_background"] = hard_loss.sum() / sample_weights[hard_indices].sum().clamp_min(1)
+    return result
+
+
 class EQLv2Loss(nn.Module):
     """EQLv2 equalization for nine sigmoid class logits.
 

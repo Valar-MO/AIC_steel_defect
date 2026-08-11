@@ -42,10 +42,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone-checkpointing", action="store_true")
     parser.add_argument("--pretrained-backbone", action="store_true")
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--model-init-from", type=Path,
+                        help="Load all compatible model weights while starting a fresh optimizer and scheduler.")
     parser.add_argument("--init-from", type=Path,
                         help="Warm-start compatible geometry weights while resetting classifier and optimizer state.")
     parser.add_argument("--freeze-geometry-epochs", type=int, default=1,
-                        help="With --init-from, freeze backbone/FPN/RPN for these initial epochs.")
+                        help="With --init-from or --model-init-from, freeze backbone/FPN/RPN for these initial epochs.")
+    parser.add_argument("--r3a", action="store_true", help="Enable final-stage ROI background-margin and online hard-background losses.")
+    parser.add_argument("--r3a-keep-weight", type=float, default=.35)
+    parser.add_argument("--r3a-class-weight", type=float, default=.15)
+    parser.add_argument("--r3a-hard-background-weight", type=float, default=.10)
+    parser.add_argument("--r3a-positive-margin", type=float, default=.40)
+    parser.add_argument("--r3a-class-margin", type=float, default=.20)
+    parser.add_argument("--r3a-background-margin", type=float, default=.20)
+    parser.add_argument("--r3a-hard-background-topk", type=int, default=3)
     parser.add_argument("--stop-after-epoch", type=int,
                         help="Cleanly stop after this one-based epoch while preserving the full planned scheduler horizon.")
     parser.add_argument("--validate-every", type=int, default=1)
@@ -109,10 +119,33 @@ def _load_geometry_warm_start(model: GLCascadeDetector, checkpoint_path: Path) -
     return {"loaded": len(loadable), "missing": len(missing), "unexpected": len(unexpected)}
 
 
+def _load_model_only(model: GLCascadeDetector, checkpoint_path: Path) -> dict[str, int]:
+    source = torch.load(checkpoint_path, map_location="cpu", weights_only=False)["model"]
+    missing, unexpected = model.load_state_dict(source, strict=True)
+    return {"loaded": len(source), "missing": len(missing), "unexpected": len(unexpected)}
+
+
 def _set_geometry_trainable(model: GLCascadeDetector, trainable: bool) -> None:
     for module in (model.backbone, model.fpn, model.rpn):
         for parameter in module.parameters():
             parameter.requires_grad_(trainable)
+
+
+def _set_r3a_trainable(model: GLCascadeDetector) -> None:
+    """Keep e9 geometry fixed and tune only the final ROI classification path."""
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    final_stage = model.roi_heads.stages[-1]
+    for name, parameter in final_stage.named_parameters():
+        if not name.startswith(("foreground.", "box_delta.", "quality.")):
+            parameter.requires_grad_(True)
+
+
+def _optimized_losses(losses: dict[str, torch.Tensor], r3a: bool) -> dict[str, torch.Tensor]:
+    if not r3a:
+        return losses
+    names = ("roi3_class", "roi3_keep_margin", "roi3_class_margin", "roi3_hard_background")
+    return {name: losses[name] for name in names}
 
 
 def _validate(opt: argparse.Namespace, checkpoint: Path, epoch: int) -> dict:
@@ -133,8 +166,10 @@ def main() -> None:
     args = parse_args()
     if args.batch_size <= 0 or args.accumulate <= 0:
         raise ValueError("batch-size and accumulate must be positive")
-    if args.resume and args.init_from:
-        raise ValueError("--resume and --init-from are mutually exclusive")
+    if sum(value is not None for value in (args.resume, args.init_from, args.model_init_from)) > 1:
+        raise ValueError("--resume, --init-from, and --model-init-from are mutually exclusive")
+    if args.r3a and not args.model_init_from:
+        raise ValueError("--r3a requires --model-init-from so it preserves an existing detector geometry.")
     if args.backbone == "r50_dcn" and not args.pretrained_backbone:
         raise ValueError("Refusing to train randomly initialized r50_dcn. Pass --pretrained-backbone or use internimage_s with its official checkpoint.")
     if args.backbone == "internimage_s" and not args.internimage_checkpoint.is_file():
@@ -150,7 +185,12 @@ def main() -> None:
     model = GLCascadeDetector(backbone_name=args.backbone, pretrained_backbone=use_pretrained,
                               internimage_root=str(args.internimage_root), internimage_checkpoint=str(args.internimage_checkpoint),
                               backbone_checkpointing=args.backbone_checkpointing, classifier_mode=args.classifier_mode,
-                              defect_class_counts=_defect_instance_counts(dataset)).to(device)
+                              defect_class_counts=_defect_instance_counts(dataset), r3a_enabled=args.r3a,
+                              r3a_keep_weight=args.r3a_keep_weight, r3a_class_weight=args.r3a_class_weight,
+                              r3a_hard_background_weight=args.r3a_hard_background_weight,
+                              r3a_positive_margin=args.r3a_positive_margin, r3a_class_margin=args.r3a_class_margin,
+                              r3a_background_margin=args.r3a_background_margin,
+                              r3a_hard_background_topk=args.r3a_hard_background_topk).to(device)
     optimizer = torch.optim.AdamW(_parameter_groups(model, args.learning_rate, args.backbone_lr_mult, use_pretrained),
                                   weight_decay=args.weight_decay)
     optimizer_steps_per_epoch = math.ceil(len(loader) / args.accumulate)
@@ -164,16 +204,19 @@ def main() -> None:
         if "scheduler" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = int(checkpoint["epoch"]) + 1
-    warm_start = _load_geometry_warm_start(model, args.init_from) if args.init_from else None
+    warm_start = (_load_geometry_warm_start(model, args.init_from) if args.init_from else
+                  _load_model_only(model, args.model_init_from) if args.model_init_from else None)
+    if args.r3a:
+        _set_r3a_trainable(model)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "train_config.json").write_text(json.dumps(vars(args), default=str, ensure_ascii=False, indent=2), encoding="utf-8")
     end_epoch = min(args.epochs, args.stop_after_epoch or args.epochs)
     if end_epoch < start_epoch:
         raise ValueError(f"--stop-after-epoch={end_epoch} is before resumed epoch {start_epoch + 1}")
-    geometry_frozen = None
+    geometry_frozen = True if args.r3a else None
     for epoch in range(start_epoch, end_epoch):
-        should_freeze = bool(args.init_from and epoch < args.freeze_geometry_epochs)
-        if should_freeze != geometry_frozen:
+        should_freeze = bool((not args.r3a) and warm_start and epoch < args.freeze_geometry_epochs)
+        if not args.r3a and should_freeze != geometry_frozen:
             _set_geometry_trainable(model, not should_freeze)
             geometry_frozen = should_freeze
             print(json.dumps({"epoch": epoch + 1, "geometry_frozen": geometry_frozen, "warm_start": warm_start}, ensure_ascii=False), flush=True)
@@ -185,13 +228,14 @@ def main() -> None:
             image_sizes = torch.stack([target["image_size"] for target in targets])
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 output = model(local, global_image, views, image_sizes, targets)
-                loss = sum(output.losses.values()) / args.accumulate
+                optimized_losses = _optimized_losses(output.losses, args.r3a)
+                loss = sum(optimized_losses.values()) / args.accumulate
             scaler.scale(loss).backward()
             if step % args.accumulate == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer); scaler.update(); scheduler.step(); optimizer.zero_grad(set_to_none=True)
-            for name, value in output.losses.items():
+            for name, value in optimized_losses.items():
                 running[name] = running.get(name, 0.) + float(value.detach())
             if step % 20 == 0:
                 print(json.dumps({"epoch": epoch + 1, "step": step, "loss": round(sum(running.values()) / step, 5),

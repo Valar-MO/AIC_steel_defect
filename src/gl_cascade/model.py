@@ -26,7 +26,11 @@ class GLCascadeDetector(nn.Module):
     def __init__(self, num_classes: int = 9, backbone_name: str = "r50_dcn", pretrained_backbone: bool = True,
                  internimage_root: str | None = None, internimage_checkpoint: str | None = None,
                  backbone_checkpointing: bool = False, ranking_quality_weight: float = .25,
-                 classifier_mode: str = "softmax_background", defect_class_counts: list[int] | None = None):
+                 classifier_mode: str = "softmax_background", defect_class_counts: list[int] | None = None,
+                 r3a_enabled: bool = False, r3a_keep_weight: float = .35, r3a_class_weight: float = .15,
+                 r3a_hard_background_weight: float = .10, r3a_positive_margin: float = .40,
+                 r3a_class_margin: float = .20, r3a_background_margin: float = .20,
+                 r3a_hard_background_topk: int = 3):
         super().__init__()
         self.backbone = build_backbone(backbone_name, pretrained=pretrained_backbone, internimage_root=internimage_root,
                                        internimage_checkpoint=internimage_checkpoint, with_checkpointing=backbone_checkpointing)
@@ -34,7 +38,12 @@ class GLCascadeDetector(nn.Module):
         self.rpn = ATSSRPN()
         self.num_classes, self.classifier_mode = num_classes, classifier_mode
         self.roi_heads = CascadeROIHeads(num_classes=num_classes, classifier_mode=classifier_mode,
-                                         defect_class_counts=defect_class_counts)
+                                         defect_class_counts=defect_class_counts, r3a_enabled=r3a_enabled,
+                                         r3a_keep_weight=r3a_keep_weight, r3a_class_weight=r3a_class_weight,
+                                         r3a_hard_background_weight=r3a_hard_background_weight,
+                                         r3a_positive_margin=r3a_positive_margin, r3a_class_margin=r3a_class_margin,
+                                         r3a_background_margin=r3a_background_margin,
+                                         r3a_hard_background_topk=r3a_hard_background_topk)
         self.ranking_quality_weight = ranking_quality_weight
 
     def forward(self, local: torch.Tensor, global_image: torch.Tensor, view_xyxy: torch.Tensor,
